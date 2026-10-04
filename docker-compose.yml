@@ -1,0 +1,54 @@
+# cpa-panel 一键起（需要 Docker）
+#
+# 前置：确认你的 CPA 核心已经配置了管理密钥，否则面板会明确报
+#       「上游未启用 Management API」——这是上游没开，不是面板的问题。
+#
+#   docker compose up -d
+#   docker compose logs -f cpa-panel
+#
+# 首次需要初始化管理员 + 节点（一次性）：
+#   docker compose run --rm cpa-panel init \
+#     --password '你的强口令' \
+#     --node http://host.docker.internal:8317 \
+#     --node-key 'sk-你的管理密钥'
+
+services:
+  cpa-panel:
+    build: .
+    image: cpa-panel:latest
+    container_name: cpa-panel
+    restart: unless-stopped
+    # 面板默认只监听容器内；下面把端口映射到宿主机本机回环，避免直接暴露公网
+    ports:
+      - "127.0.0.1:18317:18317"
+    environment:
+      CPAPANEL_HOST: "0.0.0.0"
+      CPAPANEL_PORT: "18317"
+      CPAPANEL_DATA_DIR: /data
+      CPAPANEL_DATABASE: /data/panel.db
+      CPAPANEL_LOG_LEVEL: INFO
+      # ★ 上游管理密钥：可用 environment 直接给，或初始化后存在数据库里（推荐后者）
+      # CPAPANEL_NODE_URL: "http://host.docker.internal:8317"
+      # CPAPANEL_NODE_KEY: "sk-xxx"
+    extra_hosts:
+      # 让容器能用 host.docker.internal 访问宿主机上的 CPA
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:18317/api/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # 可选：如果你也在容器里跑 CPA 核心，就把它的服务名填进节点的 base_url，
+  # 并删掉 extra_hosts 与 host.docker.internal 的引用。
+  #
+  # cli-proxy-api:
+  #   image: ghcr.io/router-for-me/cli-proxy-api:latest
+  #   volumes:
+  #     - ./cpa-config:/app/config
+  #   ports:
+  #     - "127.0.0.1:8317:8317"
