@@ -38,12 +38,18 @@ class MockState:
         self.error_logs: Dict[str, str] = {}
         self.usage_stats_enabled = True
         self.oauth_sessions: Dict[str, Dict[str, Any]] = {}
+        # OAuth 排除模型 / 模型别名 / 请求日志开关 —— 都是「整张 map 一起 PUT」语义
+        self.oauth_excluded: Dict[str, List[str]] = {}
+        self.oauth_alias: Dict[str, Any] = {}
+        self.request_log = False
         self.calls: List[Dict[str, Any]] = []      # 记录收到的请求，便于断言
         self.config: Dict[str, Any] = {
             "port": 8317, "version": "6.9.49",
             "auth-dir": "/tmp/cpa-auth",
             "api-keys": [],
             "usage-statistics-enabled": True,
+            # 上游把请求日志开关放在这里，面板的 GET /api/upstream/request-log 就是读它
+            "observability": {"request-log": False},
         }
 
     # ------------------------------------------------------------------ 内部
@@ -207,6 +213,7 @@ class MockHandlerClass(BaseHTTPRequestHandler):
         with self.state.lock:
             self.state.calls.append({"method": method, "path": path,
                                      "query": {k: v[0] for k, v in query.items()},
+                                     "body": body.decode("utf-8", "replace"),
                                      "auth": self.headers.get("Authorization") or "",
                                      "mgmt_key": self.headers.get("X-Management-Key") or ""})
 
@@ -314,13 +321,24 @@ class MockHandlerClass(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json(self, body: bytes) -> Dict[str, Any]:
+        """读 body 当作 JSON **对象**；不是对象（或解析失败）就给空 dict。
+
+        ⚠️ 这是个“宽容”解析器：它会把裸数组/裸字符串默默变成 `{}`。
+        对于「body 可能是数组」的端点（如 `PUT /config/access/api-keys`，
+        官方 WebUI 发的就是裸数组），必须用 `_read_json_any`，
+        否则客户端发错格式也不会报错（会被当成“空列表”）—— 实测过这个坑。
+        """
+        data = self._read_json_any(body)
+        return data if isinstance(data, dict) else {}
+
+    def _read_json_any(self, body: bytes) -> Any:
+        """读 body 当作任意 JSON 值（dict / list / str / number）。解析失败给 `{}`。"""
         if not body:
             return {}
         try:
-            data = json.loads(body.decode("utf-8"))
+            return json.loads(body.decode("utf-8"))
         except ValueError:
             return {}
-        return data if isinstance(data, dict) else {}
 
     # --- config ---
 
@@ -347,7 +365,7 @@ class MockHandlerClass(BaseHTTPRequestHandler):
                              body: bytes) -> None:
         if self.command == "GET":
             return self._json(200, list(self.state.api_keys))
-        data = self._read_json(body)
+        data = self._read_json_any(body)
         keys = data if isinstance(data, list) else (data.get("api-keys") or data.get("api_keys") or [])
         if self.command == "PUT":
             self.state.api_keys = [str(k) for k in keys]
@@ -385,13 +403,58 @@ class MockHandlerClass(BaseHTTPRequestHandler):
         if method == "POST":
             return self._upload(body)
         if method == "DELETE":
-            name = query.get("name", [""])[0]
-            target = self.state.find_credential(name)
-            if not target:
-                return self._json(404, {"error": "not found"})
-            self.state.credentials = [c for c in self.state.credentials if c is not target]
-            return self._json(200, {"ok": True})
+            # 官方 WebUI：`DELETE /credentials` + body `{"names": [...]}`（单个也走批量）。
+            # 同时兼容 query `?name=` 与 `?all=true` —— 两种都要能用，否则测不出客户端的格式错误。
+            data = self._read_json_any(body)
+            names: List[str] = []
+            if isinstance(data, dict) and isinstance(data.get("names"), list):
+                names = [str(n) for n in data["names"]]
+            elif isinstance(data, list):
+                names = [str(n) for n in data]
+            elif query.get("name"):
+                names = [query["name"][0]]
+            if str(query.get("all", [""])[0]).lower() in ("true", "1", "yes"):
+                removed = len(self.state.credentials)
+                self.state.credentials = []
+                return self._json(200, {"ok": True, "deleted": removed, "all": True})
+            if not names:
+                return self._json(400, {"error": "names is required"})
+            deleted: List[str] = []
+            missing: List[str] = []
+            for one in names:
+                target = self.state.find_credential(one)
+                if not target:
+                    missing.append(one)
+                    continue
+                self.state.credentials = [c for c in self.state.credentials if c is not target]
+                deleted.append(one)
+            if not deleted:
+                return self._json(404, {"error": "not found", "missing": missing})
+            return self._json(200, {"ok": True, "deleted": len(deleted),
+                                    "files": deleted, "missing": missing})
         return self._json(405, {"error": "method not allowed"})
+
+    def h_cooldown_reset(self, params: Dict[str, str], query: Dict[str, List[str]],
+                         body: bytes) -> None:
+        """官方 `POST /routing/cooldown/reset`，**body 必须是 auth_index**（不是 name）。
+
+        上游语义：把处于冷却中的凭证重新放回调度候选（清掉 next_retry_after）。
+        """
+        data = self._read_json(body)
+        auth_index = str(data.get("auth_index") or "")
+        if not auth_index:
+            return self._json(400, {"error": "auth_index is required"})
+        target = None
+        for candidate in self.state.credentials:
+            if str(candidate.get("auth_index") or "") == auth_index:
+                target = candidate
+                break
+        if target is None:
+            return self._json(404, {"error": "credential not found"})
+        target["next_retry_after"] = 0
+        target["unavailable"] = False
+        target["status"] = "active"
+        return self._json(200, {"ok": True, "auth_index": auth_index})
 
     def _upload(self, body: bytes) -> None:
         text = body.decode("utf-8", "replace")
@@ -491,8 +554,13 @@ class MockHandlerClass(BaseHTTPRequestHandler):
     def h_api_keys(self, params: Dict[str, str], query: Dict[str, List[str]], body: bytes) -> None:
         if self.command == "GET":
             return self._json(200, {"api-keys": list(self.state.api_keys)})
-        data = self._read_json(body)
-        keys = data.get("api-keys") or data.get("api_keys") or []
+        data = self._read_json_any(body)
+        # 两种 body 形状都要接受：官方 WebUI 发裸数组，部分文档写 {"api-keys": [...]}。
+        # ★ 只认包装体会掩盖客户端的错误格式（会被当成“没有 api-keys 字段”而清空全部 Key）。
+        if isinstance(data, list):
+            keys = data
+        else:
+            keys = data.get("api-keys") or data.get("api_keys") or []
         if self.command == "PUT":
             self.state.api_keys = [str(k) for k in keys]
             return self._json(200, {"ok": True, "count": len(self.state.api_keys)})
@@ -538,6 +606,42 @@ class MockHandlerClass(BaseHTTPRequestHandler):
         return self._json(200, {"plugins": []})
 
     # --- OAuth ---
+
+    def h_oauth_excluded_models(self, params: Dict[str, str], query: Dict[str, List[str]],
+                                body: bytes) -> None:
+        """`/config/oauth/excluded-models`：GET 返回整张 map，PUT **整张替换**。"""
+        if self.command == "GET":
+            return self._json(200, dict(self.state.oauth_excluded))
+        data = self._read_json_any(body)
+        if not isinstance(data, dict):
+            return self._json(400, {"error": "expected an object"})
+        self.state.oauth_excluded = {str(k): [str(m) for m in (v or [])]
+                                     for k, v in data.items() if isinstance(v, list)}
+        return self._json(200, {"ok": True})
+
+    def h_oauth_model_alias(self, params: Dict[str, str], query: Dict[str, List[str]],
+                            body: bytes) -> None:
+        if self.command == "GET":
+            return self._json(200, dict(self.state.oauth_alias))
+        data = self._read_json_any(body)
+        if not isinstance(data, dict):
+            return self._json(400, {"error": "expected an object"})
+        self.state.oauth_alias = {str(k): v for k, v in data.items()}
+        return self._json(200, {"ok": True})
+
+    def h_request_log_flag(self, params: Dict[str, str], query: Dict[str, List[str]],
+                           body: bytes) -> None:
+        """请求日志开关：body 是**裸布尔**（不是 {"enabled": true}）。"""
+        if self.command == "GET":
+            return self._json(200, self.state.request_log)
+        data = self._read_json_any(body)
+        if not isinstance(data, bool):
+            # 上游对形状不对的 body 不会报错，而是当成无效值 —— 这里刻意也这么做，
+            # 以便测试能验证「发错形状 → 开关没变」。
+            return self._json(200, {"ok": True, "ignored": True})
+        self.state.request_log = data
+        self.state.config.setdefault("observability", {})["request-log"] = data
+        return self._json(200, {"ok": True})
 
     def h_oauth_url(self, params: Dict[str, str], query: Dict[str, List[str]],
                     body: bytes) -> None:
@@ -599,6 +703,10 @@ _ROUTES_V8 = [
     _r("PATCH", r"/credentials/status") + (MockHandlerClass.h_auth_files_status,),
     _r("PATCH", r"/credentials/fields") + (MockHandlerClass.h_auth_files_fields,),
     _r("POST", r"/credentials/refresh") + (MockHandlerClass.h_auth_files_refresh,),
+    _r("POST", r"/routing/cooldown/reset") + (MockHandlerClass.h_cooldown_reset,),
+    _r("GET|PUT", r"/config/oauth/excluded-models") + (MockHandlerClass.h_oauth_excluded_models,),
+    _r("GET|PUT", r"/config/oauth/model-alias") + (MockHandlerClass.h_oauth_model_alias,),
+    _r("GET|PUT", r"/config/observability/logs/request-log") + (MockHandlerClass.h_request_log_flag,),
     _r("GET", r"/observability/usage/queue") + (MockHandlerClass.h_usage_queue,),
     _r("GET", r"/observability/usage/api-keys") + (MockHandlerClass.h_api_key_usage,),
     _r("GET|DELETE", r"/observability/logs") + (MockHandlerClass.h_logs,),

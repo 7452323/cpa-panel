@@ -158,7 +158,19 @@ def main_smoke() -> int:
         finally:
             store.close()
 
-        # 5) token / pricing / prune
+        # 5) cool：把冷却中的号手动解冻
+        #    上游只认 auth_index，所以 CLI 必须自己把它找出来（本地库没有就去上游快照里找）。
+        before = int(mock.state.find_credential("codex-3.json")["next_retry_after"])
+        check("解冻前该号确实处于冷却中", before > 0, f"next_retry_after={before}")
+        code = run(["--config", config_path, "cool", "codex-3.json"])
+        check("cool 退出码为 0", code == 0, f"exit={code}")
+        check("冷却已被清除（上游 next_retry_after 归零）",
+              int(mock.state.find_credential("codex-3.json")["next_retry_after"]) == 0,
+              str(mock.state.find_credential("codex-3.json")["next_retry_after"]))
+        code = run(["--config", config_path, "cool", "does-not-exist.json"])
+        check("不存在的凭证返回非 0 退出码", code == 1, f"exit={code}")
+
+        # 6) token / pricing / prune
         code = run(["--config", config_path, "token", "--name", "smoke"])
         check("token 退出码为 0", code == 0, f"exit={code}")
         store = Store(db_path)

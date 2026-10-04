@@ -4,6 +4,7 @@
 密钥不对是 401、没配密钥是 404、`count` 非正整数是 400、pop 后记录消失。
 """
 
+import json
 import time
 import unittest
 
@@ -257,6 +258,116 @@ class TestOAuth(unittest.TestCase):
             client = CPAClient(mock.base_url, "sk-mock-key", "v0")
             with self.assertRaises(CPAError):
                 client.start_oauth("not-a-provider")
+
+
+class TestKeyWireFormat(unittest.TestCase):
+    """下游 Key 的**线上格式**断言（不只是“调用成功了”）。
+
+    官方 WebUI 是 `apiClient.put(PATH, keys)` —— 直接发一个裸 JSON 数组
+    （见 `services/api/apiKeys.ts`）。如果客户端发成 `{"api-keys": [...]}`，
+    某些上游版本会把它当成“根本没有 api-keys 字段”，后果是**把下游 Key 全部清空**。
+    这个 bug 在只看返回值时是完全看不出来的，所以必须断言 body 形状。
+    """
+
+    def test_put_sends_bare_array(self):
+        import json as _json
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            client.put_api_keys(["sk-a", "sk-b"])
+            puts = [c for c in mock.calls() if c["method"] == "PUT"]
+            self.assertEqual(len(puts), 1, "不应该触发包装体回退")
+            self.assertEqual(_json.loads(puts[0]["body"]), ["sk-a", "sk-b"])
+            self.assertEqual(mock.state.api_keys, ["sk-a", "sk-b"])
+
+    def test_delete_sends_bare_array(self):
+        import json as _json
+        with MockCPA(prefix="v8") as mock:
+            mock.state.api_keys = ["sk-a", "sk-b"]
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            client.delete_api_keys(["sk-a"])
+            deletes = [c for c in mock.calls() if c["method"] == "DELETE"]
+            self.assertEqual(_json.loads(deletes[0]["body"]), ["sk-a"])
+            self.assertEqual(mock.state.api_keys, ["sk-b"])
+
+    def test_v0_also_accepts_bare_array(self):
+        """v0 路径同样要能处理裸数组（旧前缀不能成为“静默清空 Key”的漏洞）。"""
+        with MockCPA(prefix="v0") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v0")
+            client.put_api_keys(["sk-only"])
+            self.assertEqual(mock.state.api_keys, ["sk-only"])
+
+
+class TestCredentialWrites(unittest.TestCase):
+    """凭证写操作的**线上形状**断言（对着官方 WebUI 的请求体）。
+
+    这些都不是“调用成功了就行”的测试："names" 写成 "name"、auth_index 漏传，
+    上游都可能返回 200 却什么都没干（或者删错东西），只有断言 body 才治得住。
+    """
+
+    def test_delete_sends_names_body(self):
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            mock.seed_credentials(SAMPLE_CREDENTIALS)
+            client.delete_auth_file("codex-1.json")
+            dels = [c for c in mock.calls() if c["method"] == "DELETE"]
+            self.assertEqual(len(dels), 1, "不应触发 query 回退")
+            self.assertEqual(json.loads(dels[0]["body"]), {"names": ["codex-1.json"]})
+            self.assertIsNone(mock.state.find_credential("codex-1.json"))
+
+    def test_batch_delete_only_touches_listed(self):
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            mock.seed_credentials(SAMPLE_CREDENTIALS)
+            client.delete_auth_files(["codex-1.json", "codex-2.json"])
+            self.assertIsNone(mock.state.find_credential("codex-1.json"))
+            self.assertIsNone(mock.state.find_credential("codex-2.json"))
+            self.assertIsNotNone(mock.state.find_credential("codex-3.json"))
+
+    def test_delete_all_uses_all_flag(self):
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            mock.seed_credentials(SAMPLE_CREDENTIALS)
+            client.delete_all_auth_files()
+            self.assertEqual(len(mock.state.credentials), 0)
+            dels = [c for c in mock.calls() if c["method"] == "DELETE"]
+            self.assertEqual(dels[0]["query"].get("all"), "true")
+
+    def test_reset_cooldown_clears_next_retry(self):
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            mock.seed_credentials(SAMPLE_CREDENTIALS)
+            cooling = mock.state.find_credential("codex-3.json")
+            self.assertGreater(int(cooling["next_retry_after"]), 0)
+            expected_index = cooling["auth_index"]
+            client.reset_cooldown(expected_index)
+            after = mock.state.find_credential("codex-3.json")
+            self.assertEqual(int(after["next_retry_after"]), 0)
+            resets = [c for c in mock.calls() if c["path"].endswith("/routing/cooldown/reset")]
+            self.assertEqual(json.loads(resets[0]["body"]), {"auth_index": expected_index})
+
+    def test_reset_cooldown_without_auth_index_is_rejected_locally(self):
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            with self.assertRaises(CPAError) as ctx:
+                client.reset_cooldown("")
+            self.assertEqual(ctx.exception.status, 400)
+            self.assertEqual(len(mock.calls()), 0, "本地就该拦住，不发无效请求")
+
+    def test_reset_cooldown_on_v0_is_501_not_404(self):
+        """冷却重置是 v8 能力。v0 连接下要**明说支持不了**，
+        而不是发一个必然 404 的请求，让用户去猜是路径写错了还是上游没开。"""
+        with MockCPA(prefix="v0") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v0")
+            with self.assertRaises(CPAError) as ctx:
+                client.reset_cooldown("idx-3")
+            self.assertEqual(ctx.exception.status, 501)
+
+    def test_refresh_all_sends_all_flag(self):
+        with MockCPA(prefix="v8") as mock:
+            client = CPAClient(mock.base_url, "sk-mock-key", "v8")
+            client.refresh_auth_files(all_=True)
+            posts = [c for c in mock.calls() if c["method"] == "POST"]
+            self.assertEqual(json.loads(posts[0]["body"]), {"all": True})
 
 
 if __name__ == "__main__":

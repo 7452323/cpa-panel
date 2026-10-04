@@ -62,6 +62,49 @@ class TestClassify(unittest.TestCase):
     def test_healthy(self):
         self.assertEqual(classify_credential({"status": "active"}, self.now)["state"], STATE_HEALTHY)
 
+    def test_transient_text_is_not_treated_as_dead(self):
+        """瞬态文案不能把号判死 —— 这是同类项目踩过的坑，也是本项目的红线。
+
+        “429 too many requests” 是「现在别打」，不是「额度没了」；
+        “upstream 401 from proxy (connection reset)” 是链路问题，不是凭证失效。
+        两者都只能当弱证据，井且不得触发禁用/删除。
+        """
+        rate_limited = classify_credential({"name": "a.json", "status": "error",
+                                            "status_message": "429 Too Many Requests"})
+        self.assertEqual(rate_limited["state"], STATE_COOLING, rate_limited)
+        self.assertEqual(rate_limited["evidence_level"], "weak")
+
+        flaky = classify_credential({"name": "b.json", "status": "error",
+                                     "status_message": "upstream 401 from proxy: connection reset"})
+        self.assertNotEqual(flaky["state"], STATE_UNAUTHORIZED, flaky)
+        self.assertNotEqual(flaky["state"], STATE_QUOTA_EXHAUSTED, flaky)
+
+    def test_strong_vs_weak_evidence(self):
+        """字段级证据 = strong，纯文案 = weak（巡检只允许对 strong 的号动手）。"""
+        strong_auth = classify_credential({"name": "a.json", "status": "error",
+                                           "status_message": "token expired"})
+        self.assertEqual(strong_auth["state"], STATE_UNAUTHORIZED)
+        self.assertEqual(strong_auth["evidence_level"], "strong")
+
+        status_code = classify_credential({"name": "b.json", "status": "401"})
+        self.assertEqual(status_code["state"], STATE_UNAUTHORIZED)
+        self.assertEqual(status_code["evidence_level"], "strong")
+
+        weak_auth = classify_credential({"name": "c.json", "status": "error",
+                                         "status_message": "unauthorized"})
+        self.assertEqual(weak_auth["state"], STATE_UNAUTHORIZED)
+        self.assertEqual(weak_auth["evidence_level"], "weak")
+
+        field_quota = classify_credential({"name": "d.json", "status": "active",
+                                           "quota": {"signals": {"quota_exhausted": True}}})
+        self.assertEqual(field_quota["state"], STATE_QUOTA_EXHAUSTED)
+        self.assertEqual(field_quota["evidence_level"], "strong")
+
+        text_quota = classify_credential({"name": "e.json", "status": "error",
+                                          "status_message": "insufficient quota for this model"})
+        self.assertEqual(text_quota["state"], STATE_QUOTA_EXHAUSTED)
+        self.assertEqual(text_quota["evidence_level"], "weak")
+
     def test_error_unknown_reason_is_unknown(self):
         result = classify_credential({"status": "error"}, self.now)
         self.assertEqual(result["state"], "unknown")

@@ -393,6 +393,75 @@ class TestUsagePipeline(unittest.TestCase):
 
 
 class TestInspection(unittest.TestCase):
+    def test_circuit_breaker_blocks_mass_deletion(self):
+        """批量掉号时巡检必须停手（这是本项目最重要的一道安全闸门）。
+
+        构造：把 6 个号里的 5 个都弄成失效 → 就绪率 1/6 ≈ 17% < 阈值 50%。
+        此时即使**明确请求了 apply**，也不允许执行任何删除/禁用动作：
+        因为「集体失效」极可能是上游事故（封号潮/风控/IP 被封），
+        而现在就把剩下的号删掉，等上游恢复时手里就什么都不剩了。
+        """
+        mock = FIXTURE["mock"]
+        original = [dict(c) for c in mock.state.credentials]
+        self.addCleanup(lambda: setattr(mock.state, "credentials", original))
+        for cred in mock.state.credentials:
+            cred["status"] = "error"
+            cred["status_message"] = "token expired"
+            cred["disabled"] = False
+            cred["unavailable"] = False
+
+        status, body = api().call("POST", "/api/inspections/run",
+                                  {"node_id": FIXTURE["node_id"], "dry_run": False})
+        self.assertEqual(status, 200)
+        node = body["result"]["nodes"][0]
+        circuit = node["circuit"]
+        self.assertTrue(circuit["enabled"])
+        self.assertTrue(circuit["open"], circuit)
+        self.assertLess(circuit["ready_ratio"], circuit["threshold"])
+        self.assertEqual(node["mode"], "circuit_break")
+        self.assertGreaterEqual(node["planned"], 1, "计划还是要有，人得看得见")
+        self.assertEqual(node["executed"], 0, "熔断时一项都不能执行")
+        # 上游一个号都没被改动
+        self.assertTrue(all(not c["disabled"] for c in mock.state.credentials))
+        # 并且要留下审计与告警痕迹，而不是静默吞掉
+        _, audit = api().call("GET", "/api/audit?action=inspection.circuit_open")
+        self.assertTrue(audit["audit"])
+
+    def test_weak_evidence_is_marked_not_disabled(self):
+        """只有文案证据时，apply 巡检也只能「标记」，一个号都不许禁用。
+
+        场景：上游临时限流，把 “429 too many requests” 写进 status_message。
+        若面板据此禁用/删除，一次上游抖动就能清掉一批好号（而同批号几分钟后就恢复）。
+        """
+        mock = FIXTURE["mock"]
+        original = [dict(c) for c in mock.state.credentials]
+        self.addCleanup(lambda: setattr(mock.state, "credentials", original))
+        from tests.mock_cpa import _sample_credential
+        # a) 非瞬态的文案级额度提示 —— 弱证据，只能标记
+        mock.state.credentials.append(_sample_credential(
+            "weak-quota.json", "idx-weakq", status="error",
+            status_message="insufficient quota for this model"))
+        # b) 瞬态限流 —— 连标记都不用，直接按冷却态等它自愈
+        mock.state.credentials.append(_sample_credential(
+            "flaky-429.json", "idx-flaky", status="error",
+            status_message="429 Too Many Requests"))
+        # 先同步进本地库，否则巡检根本看不到它们
+        api().call("POST", "/api/credentials/sync", {"node_id": FIXTURE["node_id"]})
+
+        status, body = api().call("POST", "/api/inspections/run",
+                                  {"node_id": FIXTURE["node_id"], "dry_run": False})
+        self.assertEqual(status, 200)
+        node = body["result"]["nodes"][0]
+        self.assertFalse(node["circuit"]["open"], node["circuit"])
+        planned = [a for a in node["actions"] if a.get("name") == "weak-quota.json"]
+        self.assertTrue(planned, "这个号必须出现在计划里（哪怕只是标记）")
+        self.assertEqual(planned[0]["action"], "mark", planned[0])
+        for name in ("weak-quota.json", "flaky-429.json"):
+            self.assertFalse(mock.state.find_credential(name)["disabled"],
+                             "只有文案证据时绝不允许改动上游")
+        self.assertGreaterEqual(node["counts"]["cooling"], 2,
+                               "瞬态限流应该落在冷却态（等自愈），而不是被当成额度耗尽")
+
     def test_dry_run_changes_nothing(self):
         mock = FIXTURE["mock"]
         # 把额度耗尽的号恢复成未禁用，保证本轮确实有「计划」可出
@@ -445,10 +514,202 @@ class TestInspection(unittest.TestCase):
         self.assertGreaterEqual(len(body["credential"]["samples"]), 2)
 
 
+# --------------------------------------------------------------------------- 批量动作
+
+
+class TestCredentialActions(unittest.TestCase):
+    """冷却重置 / 批量动作 / 清空全部。
+
+    这些动作会**真改上游状态**，而 FIXTURE 是模块级共享的（所有测试类用同一套 mock 状态），
+    所以每个用例结束都要把凭证表恢复原样 —— 否则后面的用例会莫名地失败，
+    而查起来会以为是业务 bug。
+    """
+
+    def setUp(self):
+        self.mock = FIXTURE["mock"]
+        # 本类按字母序会最先跑，此时本地库还没同步过凭证 —— 先同步一次拿到 id 映射。
+        # （不依赖其他测试类的执行顺序来“顺手”完成初始化。）
+        api().call("POST", "/api/credentials/sync", {"node_id": FIXTURE["node_id"]})
+        self.original = [dict(c) for c in self.mock.state.credentials]
+        self.addCleanup(lambda: setattr(self.mock.state, "credentials", self.original))
+
+    def _all(self):
+        _, listing = api().call("GET", "/api/credentials")
+        return listing["credentials"]
+
+    def _id_of(self, name):
+        matches = [c for c in self._all() if c["name"] == name]
+        self.assertTrue(matches, f"夹具里没有 {name}")
+        return matches[0]["id"]
+
+    def test_reset_cooldown(self):
+        """冷却中的号必须能手动解冻（上游只认 auth_index，不认 name）。"""
+        before = int(self.mock.state.find_credential("codex-3.json")["next_retry_after"])
+        self.assertGreater(before, 0)
+        status, body = api().call("POST",
+                                  f"/api/credentials/{self._id_of('codex-3.json')}/action",
+                                  {"action": "reset_cooldown"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"], body)
+        after = int(self.mock.state.find_credential("codex-3.json")["next_retry_after"])
+        self.assertEqual(after, 0)
+
+    def test_batch_disable_then_enable(self):
+        creds = self._all()[:2]
+        ids = [c["id"] for c in creds]
+        # 夹具里本来就有已禁用的号，所以要比的是“有没有变化”，而不是“一定处于启用态”
+        before = {c["name"]: bool(c["disabled"]) for c in self._all()}
+        status, body = api().call("POST", "/api/credentials/batch",
+                                  {"action": "disable", "ids": ids})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["succeeded"], 2)
+        for entry in creds:
+            self.assertTrue(self.mock.state.find_credential(entry["name"])["disabled"])
+        # 没点名的号一个都不能被牵连
+        for entry in self._all()[2:]:
+            upstream = self.mock.state.find_credential(entry["name"])
+            self.assertEqual(bool(upstream["disabled"]), before[entry["name"]],
+                             f"{entry['name']} 不在本次批量里，不应被改动")
+
+        _, body = api().call("POST", "/api/credentials/batch",
+                             {"action": "enable", "ids": ids})
+        self.assertEqual(body["succeeded"], 2)
+        for entry in creds:
+            self.assertFalse(self.mock.state.find_credential(entry["name"])["disabled"])
+
+    def test_batch_reports_per_item_result(self):
+        """一个号失败不应把整批标成失败，也不应让其余的惄惄不执行。"""
+        good = self._all()[0]
+        status, body = api().call("POST", "/api/credentials/batch",
+                                  {"action": "disable", "ids": [good["id"], 999999]})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["succeeded"], 1)
+        by_id = {r["id"]: r for r in body["results"]}
+        self.assertTrue(by_id[good["id"]]["ok"])
+        self.assertFalse(by_id[999999]["ok"])
+
+    def test_batch_unknown_action_is_rejected(self):
+        with_confirmation = api().call("POST", "/api/credentials/batch",
+                                        {"action": "rm-rf", "ids": [1]})
+        self.assertEqual(with_confirmation[0], 400)
+
+    def test_delete_all_needs_confirmation(self):
+        status, body = api().call("POST", "/api/credentials/delete-all", {})
+        self.assertEqual(status, 400)
+        self.assertIn("DELETE-ALL", str(body))
+        self.assertTrue(self.mock.state.credentials, "没确认就绝不能真删")
+
+    def test_delete_all_with_confirmation(self):
+        status, body = api().call("POST", "/api/credentials/delete-all",
+                                  {"confirm": "DELETE-ALL", "node_id": FIXTURE["node_id"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(len(self.mock.state.credentials), 0)
+
+
 # --------------------------------------------------------------------------- Key / 配置 / 日志
 
 
+class TestUpstreamOauthConfig(unittest.TestCase):
+    """OAuth 模型排除 / 模型别名 / 请求日志开关。"""
+
+    def setUp(self):
+        self.mock = FIXTURE["mock"]
+        self.original_excluded = {k: list(v) for k, v in self.mock.state.oauth_excluded.items()}
+        self.original_alias = dict(self.mock.state.oauth_alias)
+        self.original_log = self.mock.state.request_log
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.mock.state.oauth_excluded = self.original_excluded
+        self.mock.state.oauth_alias = self.original_alias
+        self.mock.state.request_log = self.original_log
+        self.mock.state.config.setdefault("observability", {})["request-log"] = self.original_log
+
+    def test_excluded_models_partial_update_keeps_others(self):
+        """改一个渠道不能把别的渠道清空 —— 上游是「整张 map 一起 PUT」，极易误伤。"""
+        api().call("POST", "/api/upstream/oauth-excluded-models",
+                   {"node_id": FIXTURE["node_id"], "provider": "codex", "models": ["gpt-4o"]})
+        status, body = api().call("POST", "/api/upstream/oauth-excluded-models",
+                                  {"node_id": FIXTURE["node_id"], "provider": "claude",
+                                   "models": ["claude-opus-4"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["providers"]["codex"], ["gpt-4o"], "改 claude 不能把 codex 清掉")
+        self.assertEqual(self.mock.state.oauth_excluded["claude"], ["claude-opus-4"])
+
+        _, got = api().call("GET",
+                            f"/api/upstream/oauth-excluded-models?node_id={FIXTURE['node_id']}")
+        self.assertEqual(got["providers"]["codex"], ["gpt-4o"])
+
+        # 空数组 = 删除该渠道
+        _, body = api().call("POST", "/api/upstream/oauth-excluded-models",
+                             {"node_id": FIXTURE["node_id"], "provider": "codex", "models": []})
+        self.assertNotIn("codex", body["providers"])
+        self.assertIn("claude", body["providers"])
+
+    def test_model_alias_roundtrip(self):
+        status, body = api().call("POST", "/api/upstream/oauth-model-alias",
+                                  {"node_id": FIXTURE["node_id"], "channel": "codex",
+                                   "aliases": [{"name": "gpt-5", "alias": "gpt-5-codex"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.mock.state.oauth_alias["codex"][0]["alias"], "gpt-5-codex")
+        _, got = api().call("GET",
+                            f"/api/upstream/oauth-model-alias?node_id={FIXTURE['node_id']}")
+        self.assertIn("codex", got["channels"])
+
+    def test_request_log_toggle_uses_bare_boolean(self):
+        status, body = api().call("POST", "/api/upstream/request-log",
+                                  {"node_id": FIXTURE["node_id"], "enabled": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["enabled"])
+        self.assertTrue(self.mock.state.request_log)
+        # 线上格式必须是**裸布尔**：官方前端是 `put(PATH, enabled)`，
+        # 发成 {"enabled":true} 会被上游当成无效值（而且不报错）。
+        puts = [c for c in self.mock.calls()
+                if c["method"] == "PUT" and c["path"].endswith("/logs/request-log")]
+        self.assertTrue(puts)
+        self.assertEqual(puts[-1]["body"].strip(), "true")
+
+        _, got = api().call("GET", f"/api/upstream/request-log?node_id={FIXTURE['node_id']}")
+        self.assertTrue(got["enabled"])
+
+    def test_request_log_requires_enabled_field(self):
+        status, _body = api().call("POST", "/api/upstream/request-log",
+                                  {"node_id": FIXTURE["node_id"]})
+        self.assertEqual(status, 400)
+
+
 class TestKeysAndConfig(unittest.TestCase):
+    def test_safety_switches_are_writable_from_panel(self):
+        """安全闸门必须能通过 `/api/config` 改。
+
+        白名单是硬编码的：新加的配置项如果忘了加进去，UI 上改了会被**静默忽略**——
+        用户以为熔断已经配好了，实际服务用的还是默认值。这类「以为生效了」最难发现，
+        所以这里逐个断言它们真的被接受了。
+        """
+        defaults = {"inspector.circuit_breaker_enabled": True,
+                    "inspector.min_ready_ratio": 0.5,
+                    "inspector.act_on_weak_evidence": False}
+        self.addCleanup(lambda: api().call("PUT", "/api/config", defaults))
+
+        status, body = api().call("PUT", "/api/config", {
+            "inspector.circuit_breaker_enabled": False,
+            "inspector.min_ready_ratio": 0.25,
+            "inspector.act_on_weak_evidence": "false",   # 字符串也要被强制成布尔
+        })
+        self.assertEqual(status, 200)
+        applied = body["applied"]
+        self.assertEqual(set(applied), set(defaults), "三个开关必须都被接受")
+        self.assertIs(applied["inspector.circuit_breaker_enabled"], False)
+        self.assertAlmostEqual(applied["inspector.min_ready_ratio"], 0.25)
+        self.assertIs(applied["inspector.act_on_weak_evidence"], False,
+                      "字符串 'false' 绝不能被当成真值")
+
+        # 改完之后真的生效（读回来的值要对）
+        _, current = api().call("GET", "/api/config")
+        self.assertFalse(current["config"]["inspector"]["circuit_breaker_enabled"])
+
     def test_key_lifecycle(self):
         mock = FIXTURE["mock"]
         status, body = api().call("POST", "/api/keys",
