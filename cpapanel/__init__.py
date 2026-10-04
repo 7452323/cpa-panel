@@ -3,7 +3,7 @@
 零第三方依赖：仅使用 Python 标准库（http.server / sqlite3 / urllib / threading）。
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["__version__", "APP_NAME"]
 
 APP_NAME = "cpa-panel"

@@ -44,6 +44,14 @@ PATHS: Dict[str, Dict[str, Optional[str]]] = {
     "logs_errors":       {"v0": "/request-error-logs", "v8": "/observability/logs/errors"},
     "request_log_by_id": {"v0": "/request-log-by-id/", "v8": "/observability/logs/requests/"},
     "api_keys":          {"v0": "/api-keys", "v8": "/config/access/api-keys"},
+    # 路由冷却重置：官方 WebUI 的 `resetCooldown` 走这个路径，body 必须是 auth_index。
+    # 它是 v8 时代的能力（v0 前缀下不存在），所以显式标为 None。
+    "cooldown_reset":    {"v0": None, "v8": "/routing/cooldown/reset"},
+    # OAuth 侧的配置能力（官方 WebUI 的配置页）。两者都是「整张 map 一起 PUT」。
+    "oauth_excluded_models": {"v0": None, "v8": "/config/oauth/excluded-models"},
+    "oauth_model_alias":     {"v0": None, "v8": "/config/oauth/model-alias"},
+    # 请求日志开关：官方 body 是一个**裸布尔**（不是 {"enabled": true}）
+    "request_log_flag":      {"v0": None, "v8": "/config/observability/logs/request-log"},
     "latest_version":    {"v0": "/latest-version", "v8": "/server/latest-version"},
     "usage_stats_flag":  {"v0": "/usage-statistics-enabled", "v8": None},
     "quota_providers":   {"v0": "/quota/providers", "v8": None},
@@ -281,14 +289,56 @@ class CPAClient:
                         content_type=f"multipart/form-data; boundary={boundary}")
 
     def delete_auth_file(self, name: str, auth_index: str = "") -> Any:
-        return self.api("DELETE", "auth_files", params={"name": name, "auth_index": auth_index or None})
+        """删除一个凭证。
+
+        官方 WebUI 对单个与批量走的是**同一条**路径：`DELETE /credentials` +
+        body `{"names": [...]}`（见 `authFiles.ts` 的 `deleteFiles` / `deleteFile`）。
+        早期实现（以及一些文档）用的是 query `?name=`，所以这里以官方为准，失败再回退。
+        """
+        return self.delete_auth_files([name])
+
+    def delete_auth_files(self, names: List[str]) -> Any:
+        payload = [str(n) for n in (names or []) if str(n).strip()]
+        if not payload:
+            raise CPAError("没有可删除的凭证名", status=400, method="DELETE", path="/credentials")
+        try:
+            return self.api("DELETE", "auth_files", body={"names": payload})
+        except CPAError as exc:
+            if exc.status not in self._KEY_BODY_FALLBACK_STATUS or len(payload) != 1:
+                raise
+            return self.api("DELETE", "auth_files", params={"name": payload[0]})
+
+    def delete_all_auth_files(self) -> Any:
+        """清空上游全部凭证（官方：`DELETE /credentials?all=true`）。
+
+        ⚠️ 这是不可逆的毁天灭地操作，面板侧必须二次确认（输入确认词）才允许调用。
+        """
+        return self.api("DELETE", "auth_files", params={"all": "true"})
+
+    def reset_cooldown(self, auth_index: str) -> Any:
+        """重置某个凭证的路由冷却，让它立刻重新参与调度。
+
+        官方 `resetCooldown(authIndex)` → `POST /routing/cooldown/reset`，**body 是 auth_index**
+        （不是 name！）。冷却中的号想提前复用只能靠它，否则只能等 `next_retry_after`。
+        """
+        if not auth_index:
+            raise CPAError("重置冷却需要 auth_index（凭证的上游稳定索引）",
+                           status=400, method="POST", path="/routing/cooldown/reset")
+        if self.resolve_prefix() != "v8":
+            raise CPAError("重置冷却需要上游 v8 管理 API（当前连接的是 v0）", status=501)
+        return self.api("POST", "cooldown_reset", body={"auth_index": str(auth_index)})
 
     def patch_auth_file_status(self, name: str, disabled: bool, auth_index: str = "") -> Any:
-        return self.api("PATCH", "auth_files_status",
-                        body={"name": name, "auth_index": auth_index or None, "disabled": bool(disabled)})
+        # 与官方一致：没传 auth_index 时**不要把字段带上**（避免把 null 发给上游）
+        body: Dict[str, Any] = {"name": name, "disabled": bool(disabled)}
+        if auth_index:
+            body["auth_index"] = auth_index
+        return self.api("PATCH", "auth_files_status", body=body)
 
     def patch_auth_file_fields(self, name: str, fields: Dict[str, Any], auth_index: str = "") -> Any:
-        body = {"name": name, "auth_index": auth_index or None}
+        body: Dict[str, Any] = {"name": name}
+        if auth_index:
+            body["auth_index"] = auth_index
         body.update(fields or {})
         return self.api("PATCH", "auth_files_fields", body=body)
 
@@ -340,11 +390,58 @@ class CPAClient:
         data = self.api("GET", "api_keys")
         return _extract_key_list(data)
 
+    # 下游 Key 的整表替换：**body 形状跟着官方 WebUI 走**。
+    # 官方前端 `services/api/apiKeys.ts` 是 `replace: keys => put(PATH, keys)`，
+    # 也就是直接发一个裸 JSON 数组；而部分文档/旧实现写的是 `{"api-keys": [...]}`。
+    # 两者上游都可能接受，但官方那个一定是能用的那个 → 以裸数组为准，失败再回退一次。
+    _KEY_BODY_FALLBACK_STATUS = (400, 404, 405, 415, 422)
+
     def put_api_keys(self, keys: List[str]) -> Any:
-        return self.api("PUT", "api_keys", body={"api-keys": list(keys)})
+        payload = [str(k) for k in keys]
+        try:
+            return self.api("PUT", "api_keys", body=payload)
+        except CPAError as exc:
+            if exc.status not in self._KEY_BODY_FALLBACK_STATUS:
+                raise
+            return self.api("PUT", "api_keys", body={"api-keys": payload})
 
     def delete_api_keys(self, keys: List[str]) -> Any:
-        return self.api("DELETE", "api_keys", body={"api-keys": list(keys)})
+        payload = [str(k) for k in keys]
+        try:
+            return self.api("DELETE", "api_keys", body=payload)
+        except CPAError as exc:
+            if exc.status not in self._KEY_BODY_FALLBACK_STATUS:
+                raise
+            return self.api("DELETE", "api_keys", body={"api-keys": payload})
+
+    # ------------------------------------------------------------------ OAuth 排除 / 别名
+
+    def get_oauth_excluded_models(self) -> Dict[str, List[str]]:
+        """`{provider: [模型名...]}`：某个 OAuth 渠道不接哪些模型。"""
+        data = self.api("GET", "oauth_excluded_models")
+        return {str(k): [str(m) for m in (v or [])]
+                for k, v in (data or {}).items() if isinstance(v, list)}
+
+    def put_oauth_excluded_models(self, mapping: Dict[str, List[str]]) -> Any:
+        """整张 map 替换（上游没有单条增删接口，官方也是整张 PUT）。"""
+        payload = {str(k): [str(m) for m in (v or [])] for k, v in (mapping or {}).items()}
+        return self.api("PUT", "oauth_excluded_models", body=payload)
+
+    def get_oauth_model_alias(self) -> Dict[str, Any]:
+        """`{channel: [{name, alias, ...}]}`：模型别名映射。"""
+        data = self.api("GET", "oauth_model_alias")
+        return data if isinstance(data, dict) else {}
+
+    def put_oauth_model_alias(self, mapping: Dict[str, Any]) -> Any:
+        return self.api("PUT", "oauth_model_alias", body=dict(mapping or {}))
+
+    def set_request_log(self, enabled: bool) -> Any:
+        """开/关上游的请求日志（排障时开，平时关着省 IO）。
+
+        ⚠️ 官方前端发的是**裸布尔**（`put(PATH, enabled)`），不是 `{"enabled": ...}`：
+        发错形状时上游很可能把整个 payload 当成无效值而默默关掉日志。
+        """
+        return self.api("PUT", "request_log_flag", body=bool(enabled))
 
     # ------------------------------------------------------------------ 日志
 

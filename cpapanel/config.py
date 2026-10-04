@@ -56,13 +56,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "standby_pool": True,            # 把失效号移入本地备用池而不是直接删
         "target_active": 0,              # >0 时不足会从备用池转活跃，并触发低水位告警
         "promote_standby_when_low": True,
+        # 就绪率熔断：批量掉号时先停手，避免「集体失效 → 一轮删掉半个池子」。
+        # 就绪 = 总数 - 需重登 - 额度耗尽（冷却与已禁用不算坏），低于比例则本轮只出计划。
+        "circuit_breaker_enabled": True,
+        "min_ready_ratio": 0.5,
+        # 只有文案证据（status_message 里一句 “429 too many requests”）时，
+        # 是否允许做不可逆动作（禁用/删除）。默认 **False**：先只标记 + 告警，
+        # 因为瞬时限流几分钟后自己就好，而删掉的号回不来。
+        "act_on_weak_evidence": False,
     },
     # --- 通知 ---
     "notify": {
         "webhook_url": "",
         "telegram_bot_token": "",
         "telegram_chat_id": "",
-        "events": ["inspection.unauthorized", "inspection.low_pool", "collector.gap", "collector.error"],
+        "events": ["inspection.unauthorized", "inspection.low_pool", "inspection.circuit_open",
+                   "collector.gap", "collector.error"],
         "min_interval_seconds": 300,     # 同事件去抖
     },
     # --- 其他 ---

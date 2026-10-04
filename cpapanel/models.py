@@ -26,20 +26,48 @@ STATE_UNAUTHORIZED = "unauthorized"  # 真实失效，必须重新登录
 STATE_DISABLED = "disabled"
 STATE_UNKNOWN = "unknown"
 
-UNAUTHORIZED_HINTS = (
-    "token expired", "expired", "invalid_grant", "unauthorized", "401",
-    "invalid api key", "authentication", "re-authenticate", "login required",
-    "refresh token", "revoked", "account deactivated",
+# 认证失效的**强**提示：这些短语本身就是「凭证不能再用了」的明确表述，可以直接采信。
+UNAUTHORIZED_STRONG_HINTS = (
+    "token expired", "invalid_grant", "invalid api key", "refresh token",
+    "re-authenticate", "login required", "revoked", "account deactivated",
+    "invalid_grant error",
 )
+# 弱提示：单独的 "expired"/"unauthorized"/"401" 可能是别的意思
+# （"request expired"、"upstream 401 from proxy"…），只能当线索，不足以判死。
+UNAUTHORIZED_WEAK_HINTS = ("expired", "unauthorized", "401", "authentication")
+# 上游 status 字段直接给出的值：字段级，算强证据
+STRONG_STATUS_VALUES = ("401", "unauthorized", "invalid", "revoked", "deactivated")
+
 QUOTA_HINTS = ("quota", "rate limit", "rate_limit", "limit reached", "insufficient",
                "exhausted", "capacity", "usage limit", "429", "too many requests")
 
+# 瞬态错误：出现这些词时**绝不能**当成「永久失效」或「额度耗尽」。
+# 教训来自同类项目：把限流文案当耗尽、把瞬时 401 当永久失效，
+# 会让自动巡检去禁用/删除其实还能用的号 —— 而这类号往往几分钟后自己就好了。
+TRANSIENT_HINTS = (
+    "timeout", "timed out", "connection", "network", "temporary", "unavailable",
+    "reset by peer", "eof", "502", "503", "504", "429", "too many requests",
+    "rate limit", "rate_limit", "overloaded", "try again",
+)
+
+
+def _looks_transient(text: str) -> bool:
+    return any(hint in text for hint in TRANSIENT_HINTS)
+
 
 def classify_credential(entry: Dict[str, Any], now: Optional[int] = None) -> Dict[str, Any]:
-    """返回 {state, reason, evidence, recoverable}。
+    """返回 {state, reason, evidence, evidence_level, recoverable}。
 
     判定顺序刻意设计成：禁用 > 失效 > 额度 > 冷却 > 健康，
     因为「已被人工禁用」和「需要重登」的处置动作完全不同。
+
+    `evidence_level` 是本函数的**核心输出之一**：
+
+    * `strong` = 字段级证据（`status` 字段、结构化 quota signals、订阅到期时间戳）
+    * `weak`   = 仅文案命中（`status_message` 里的关键词）
+
+    巡检只允许对 `strong` 的号做不可逆动作（禁用/删除）；`weak` 的只标记+告警。
+    原因：文案是给人看的，一个瞬时的「429 too many requests」不该把号删了。
     """
     import time
     now = now or int(time.time())
@@ -47,55 +75,87 @@ def classify_credential(entry: Dict[str, Any], now: Optional[int] = None) -> Dic
     disabled = as_bool(entry.get("disabled")) or str(entry.get("status") or "").lower() == "disabled"
     if disabled:
         return {"state": STATE_DISABLED, "reason": entry.get("status_message") or "上游标记为禁用",
-                "evidence": {"disabled": True}, "recoverable": True}
+                "evidence": {"disabled": True}, "evidence_level": "strong",
+                "recoverable": True}
 
-    status = str(entry.get("status") or "").lower()
+    status = str(entry.get("status") or "").lower().strip()
     message = str(entry.get("status_message") or "")
     lowered = message.lower()
+    transient = _looks_transient(lowered)
 
-    # 1) 明确的认证失效
-    if any(hint in lowered for hint in UNAUTHORIZED_HINTS):
+    # 1) 认证失效（强证据：status 字段 | 明确的失效文案）
+    strong_auth = [h for h in UNAUTHORIZED_STRONG_HINTS if h in lowered]
+    status_auth = status in STRONG_STATUS_VALUES
+    if status_auth or strong_auth:
+        matched = ([f"status={status}"] if status_auth else []) + strong_auth
         return {"state": STATE_UNAUTHORIZED, "reason": message or "认证失败",
-                "evidence": {"status_message": message}, "recoverable": False}
+                "evidence": {"status_message": message, "status": status,
+                             "matched_via": sorted(set(matched))[:6]},
+                "evidence_level": "strong", "recoverable": False}
 
-    # 2) 订阅/token 已过期（Codex 的 id_token 会带订阅有效期）
+    # 1b) 认证失效（弱证据：只有含糊文案，且不像瞬态错误）
+    weak_auth = [h for h in UNAUTHORIZED_WEAK_HINTS if h in lowered]
+    if weak_auth and not transient:
+        return {"state": STATE_UNAUTHORIZED, "reason": message or "认证失败（按文案判断）",
+                "evidence": {"status_message": message,
+                             "matched_via": sorted(set(weak_auth))[:6]},
+                "evidence_level": "weak", "recoverable": False}
+
+    # 2) 订阅/token 已过期（Codex 的 id_token 会带订阅有效期）—— 时间戳字段，强证据
     id_token = entry.get("id_token") if isinstance(entry.get("id_token"), dict) else {}
     until = parse_ts(first(id_token, "chatgpt_subscription_active_until"))
     if until and until < now:
         return {"state": STATE_UNAUTHORIZED, "reason": "订阅已过期（id_token 有效期结束）",
-                "evidence": {"subscription_until": until}, "recoverable": False}
+                "evidence": {"subscription_until": until}, "evidence_level": "strong",
+                "recoverable": False}
 
-    # 3) 额度耗尽（上游的被动观测 signals / 文本提示）
+    # 3) 额度耗尽
+    #    3a) 字段级证据（上游的结构化 signals）—— 强
     signals = _quota_signals(entry)
-    quota_hit = [name for name, value in signals.items()
-                 if any(hint in name.lower() for hint in QUOTA_HINTS) and _truthy_signal(value)]
-    if any(hint in lowered for hint in QUOTA_HINTS):
-        quota_hit.append("status_message")
-    if quota_hit:
-        # 注意：quota_hit 里可能有 "status_message" 这类「证据来源」，它不在 signals 字典里，
-        # 所以取 evidence 时必须过滤，否则会 KeyError（这个坑实测踩过）。
-        evidence = {k: signals[k] for k in sorted(set(quota_hit))[:6] if k in signals}
+    field_hits = [name for name, value in signals.items()
+                  if any(hint in name.lower() for hint in QUOTA_HINTS) and _truthy_signal(value)]
+    if field_hits:
+        evidence = {k: signals[k] for k in sorted(set(field_hits))[:6] if k in signals}
         return {"state": STATE_QUOTA_EXHAUSTED,
-                "reason": message or "额度/限流已耗尽：" + ", ".join(sorted(set(quota_hit))[:3]),
-                "evidence": {"signals": evidence, "matched_via": sorted(set(quota_hit))[:6]},
-                "recoverable": True}
+                "reason": message or "额度已耗尽（字段证据）",
+                "evidence": {"signals": evidence, "matched_via": sorted(set(field_hits))[:6]},
+                "evidence_level": "strong", "recoverable": True}
+
+    #    3b) 文案级证据 —— 弱；而且带瞬态词的（429/rate limit）归类为「暂时别打」而不是「额度没了」
+    text_hits = [h for h in QUOTA_HINTS if h in lowered]
+    if text_hits:
+        matched = sorted(set(text_hits))[:6]
+        if transient:
+            return {"state": STATE_COOLING, "reason": message or "疑似限流，按暂时不可调度处理",
+                    "evidence": {"status_message": message, "matched_via": matched},
+                    "evidence_level": "weak", "recoverable": True}
+        return {"state": STATE_QUOTA_EXHAUSTED,
+                "reason": message or "额度/限流提示：" + ", ".join(matched[:3]),
+                "evidence": {"status_message": message, "matched_via": matched},
+                "evidence_level": "weak", "recoverable": True}
 
     # 4) 冷却中（unavailable + 未来时间点）
     next_retry = parse_ts(entry.get("next_retry_after")) or parse_ts(entry.get("nextRetryAfter"))
     unavailable = as_bool(entry.get("unavailable"))
     if unavailable and next_retry and next_retry > now:
         return {"state": STATE_COOLING, "reason": "冷却中，预计自动恢复",
-                "evidence": {"next_retry_after": next_retry}, "recoverable": True}
+                "evidence": {"next_retry_after": next_retry}, "evidence_level": "strong",
+                "recoverable": True}
     if unavailable:
         return {"state": STATE_COOLING, "reason": message or "暂不可调度",
-                "evidence": {"unavailable": True}, "recoverable": True}
+                "evidence": {"unavailable": True}, "evidence_level": "strong",
+                "recoverable": True}
 
     # 5) 错误但原因未知
+    #    注意：这里是 error/连接类错误的归宿 —— 网络/限流类问题**绝不**算失效，
+    #    否则一次代理抖动就会把好号送进备用池。
     if status == "error":
         return {"state": STATE_UNKNOWN, "reason": message or "上游标记 error（原因未知）",
-                "evidence": {"status": status}, "recoverable": True}
+                "evidence": {"status": status}, "evidence_level": "weak",
+                "recoverable": True}
 
-    return {"state": STATE_HEALTHY, "reason": "", "evidence": {}, "recoverable": True}
+    return {"state": STATE_HEALTHY, "reason": "", "evidence": {},
+            "evidence_level": "strong", "recoverable": True}
 
 
 def _quota_signals(entry: Dict[str, Any]) -> Dict[str, Any]:

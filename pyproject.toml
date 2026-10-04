@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cpa-panel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted account management panel for CLIProxyAPI (CPA): usage collection, credential inventory, quota visibility and automated pool maintenance."
 readme = "README.md"
 license = { file = "LICENSE" }

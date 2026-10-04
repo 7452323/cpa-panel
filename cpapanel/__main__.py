@@ -72,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--apply", action="store_true", help="真正执行动作（默认 dry-run）")
     p_inspect.add_argument("--json", action="store_true", help="输出完整 JSON")
 
+    p_cool = sub.add_parser("cool", help="重置某个凭证的冷却（让它立刻重新参与调度）")
+    p_cool.add_argument("name", help="凭证名，如 codex-3.json")
+    p_cool.add_argument("--node-id", type=int, default=None)
+
     p_pwd = sub.add_parser("password", help="修改管理员口令")
     p_pwd.add_argument("--username", default=None)
     p_pwd.add_argument("--password", default=None)
@@ -189,18 +193,64 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                     print(f"[失败] {node.get('node_name')}: {node.get('error')}", file=sys.stderr)
                     continue
                 counts = node.get("counts") or {}
-                print(f"[{node['node_name']}] 模式={'apply' if args.apply else 'dry-run'} "
+                # 模式要读巡检自己报的：请求了 --apply 也可能被熔断拦下来（mode=circuit_break）
+                mode = node.get("mode") or ("apply" if args.apply else "dry_run")
+                print(f"[{node['node_name']}] 模式={mode} "
                       f"扫描={node.get('scanned', 0)} 健康={counts.get('healthy', 0)} "
                       f"冷却={counts.get('cooling', 0)} 额度={counts.get('quota_exhausted', 0)} "
                       f"需重登={counts.get('unauthorized', 0)} 已禁用={counts.get('disabled', 0)}")
+                circuit = node.get("circuit") or {}
+                if circuit.get("open"):
+                    print(f"    ⚠ 就绪率熔断：{circuit.get('reason')}")
+                    print(f"       已计划 {node.get('planned', 0)} 项动作，但本轮一项都没执行。")
+                    print("       先弄清楚是上游事故（封号潮/风控）还是这些号真该清理，再决定下一步 —— "
+                          "批量掉号时删号往往会把可恢复的号码也一起干掉。")
                 for action in node.get("plan") or []:
-                    mark = "执行" if args.apply else "计划"
+                    mark = "执行" if mode == "apply" else "计划"
                     print(f"    {mark}: {action.get('action')} {action.get('name')} — {action.get('reason')}")
                 if not (node.get("plan") or []):
                     print("    无需动作")
             if not args.apply:
                 print("\n提示：这是 dry-run，未改动上游。确认无误后加 --apply 执行。")
         return 1 if failed_nodes else 0
+    finally:
+        panel.close()
+
+
+def cmd_cool(args: argparse.Namespace) -> int:
+    """重置某个凭证的路由冷却（上游 `POST /routing/cooldown/reset`）。
+
+    上游只接受 auth_index，所以本地没有时要从上游快照里找一次 —— 否则用户会看到一个
+    “成功”但什么都没发生的操作。
+    """
+    panel = build(Config.load(args.config))
+    try:
+        node_id = args.node_id
+        if not node_id:
+            nodes = panel.store.list_nodes(only_enabled=True)
+            node_id = int(nodes[0]["id"]) if nodes else 0
+        if not node_id:
+            print("尚未配置任何 CPA 节点", file=sys.stderr)
+            return 1
+        client = panel.inspector.client_for(int(node_id))
+        row = panel.store.q1("SELECT * FROM credentials WHERE node_id = ? AND name = ?",
+                             (int(node_id), args.name))
+        auth_index = str(row["auth_index"] or "") if row is not None else ""
+        if not auth_index:
+            raw = client.list_auth_files(name=args.name)
+            for entry in raw.get("files") or []:
+                if entry.get("name") == args.name:
+                    auth_index = str(entry.get("auth_index") or "")
+                    break
+        if not auth_index:
+            print(f"上游找不到凭证 {args.name}", file=sys.stderr)
+            return 1
+        result = panel.inspector.reset_cooldown_credential(int(node_id), args.name, auth_index)
+        if not result.get("ok"):
+            print(f"重置冷却失败：{result.get('error')}", file=sys.stderr)
+            return 1
+        print(f"[{args.name}] 冷却已重置（auth_index={auth_index}），已重新参与调度")
+        return 0
     finally:
         panel.close()
 
@@ -275,7 +325,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     handlers = {
         "init": cmd_init, "serve": cmd_serve, "collect": cmd_collect, "inspect": cmd_inspect,
-        "password": cmd_password, "token": cmd_token, "pricing": cmd_pricing, "prune": cmd_prune,
+        "cool": cmd_cool, "password": cmd_password, "token": cmd_token,
+        "pricing": cmd_pricing, "prune": cmd_prune,
     }
     if args.command == "version":
         print(f"{APP_NAME} {__version__}")

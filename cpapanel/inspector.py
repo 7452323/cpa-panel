@@ -28,6 +28,8 @@ ACTION_DELETE = "delete"
 ACTION_STANDBY = "standby"
 ACTION_PROMOTE = "promote"
 ACTION_MARK = "mark"
+# 让上游把冷却中的凭证立刻重新放回调度候选（官方：POST /routing/cooldown/reset）
+ACTION_COOLDOWN_RESET = "cooldown_reset"
 
 
 class AccountInspector:
@@ -156,16 +158,25 @@ class AccountInspector:
         pool_actions, pool_info = self._plan_pool(node_id)
         plan.extend(pool_actions)
 
-        # 4) 执行（dry-run 时只记录计划）
+        # 3.5) 熔断闸门 —— 就在“已算出要做什么”和“真的去做”之间
+        circuit = self._circuit_state(counts, len(normalized))
+        allow_execute = (not dry_run) and not circuit["open"]
+        if circuit["open"]:
+            note("warning", "巡检触发就绪率熔断，本轮只出计划不执行",
+                 node=node["name"], **{k: circuit[k] for k in ("ready", "total", "ready_ratio", "threshold")})
+            self.store.audit("inspection.circuit_open", actor="inspector",
+                             detail=circuit["reason"], ip=None)
+
+        # 4) 执行（dry-run 或熔断时只记录计划）
         executed: List[Dict[str, Any]] = []
         failures = 0
         delete_budget = int(self.config.get("inspector.max_deletes_per_run") or 20)
         for action in plan:
-            if not dry_run and action["action"] == ACTION_DELETE and delete_budget <= 0:
+            if allow_execute and action["action"] == ACTION_DELETE and delete_budget <= 0:
                 executed.append(dict(action, result="skipped", detail="已达单轮删除上限"))
                 continue
             result, detail = "planned", ""
-            if not dry_run:
+            if allow_execute:
                 try:
                     result, detail = self._execute(client, action)
                 except CPAError as exc:
@@ -177,8 +188,8 @@ class AccountInspector:
                 inspection_id, node_id, action.get("name") or "", action["action"],
                 action.get("reason") or "", result, detail or action.get("detail") or "")
             executed.append(dict(action, result=result, result_detail=detail))
-            # dry-run 不改变任何状态（包括本地元数据），否则「只做计划」就变成假话
-            if not dry_run and result == "ok":
+            # dry-run / 熔断都不改变任何状态（包括本地元数据），否则「只做计划」就变成假话
+            if allow_execute and result == "ok":
                 self._apply_local_state(node_id, action, dry_run=False)
 
         summary = {
@@ -187,6 +198,7 @@ class AccountInspector:
             "changes_detail": sync.get("changes") or [],
             "pool": pool_info,
             "quality": _quality(entries),
+            "circuit": circuit,
         }
         self.store.finish_inspection(
             inspection_id, scanned=len(normalized), active=counts.get(STATE_HEALTHY, 0),
@@ -200,6 +212,9 @@ class AccountInspector:
         result = {
             "node_id": node_id, "node_name": node["name"], "ok": True,
             "inspection_id": inspection_id, "dry_run": dry_run, "reason": reason,
+            # mode 要能区分第三种情况：请求了 apply（或后台自动），但被熔断拦住了
+            "mode": "dry_run" if dry_run else ("circuit_break" if circuit["open"] else "apply"),
+            "circuit": circuit,
             "scanned": len(normalized),
             "counts": counts, "changes": summary["changes"], "pool": pool_info,
             "planned": len(plan), "executed": sum(1 for a in executed if a.get("result") == "ok"),
@@ -211,6 +226,11 @@ class AccountInspector:
             self.last_result = result
 
         # 5) 告警
+        if circuit["open"]:
+            self.notifier.notify(
+                "inspection.circuit_open",
+                f"{node['name']} 账号池就绪率过低，已暂停自动维护",
+                f"{circuit['reason']}（已计划 {len(plan)} 项动作，本轮一项都没执行）")
         if counts.get(STATE_UNAUTHORIZED, 0) > 0:
             self.notifier.notify(
                 "inspection.unauthorized",
@@ -221,11 +241,46 @@ class AccountInspector:
             self.notifier.notify("inspection.low_pool", f"{node['name']} 可用账号低于目标",
                                  f"当前可用 {pool_info.get('active', 0)}，目标 {pool_info.get('target')}，"
                                  f"备用池 {pool_info.get('standby', 0)}。")
-        note("info", "巡检完成", node=node["name"], mode="dry-run" if dry_run else "apply",
-             scanned=len(normalized), planned=len(plan), executed=result["executed"])
+        note("info", "巡检完成", node=node["name"], mode=result["mode"],
+             scanned=len(normalized), planned=len(plan), executed=result["executed"],
+             circuit_open=circuit["open"])
         return result
 
     # ------------------------------------------------------------------ 计划
+
+    # ------------------------------------------------------------------ 熔断
+
+    def _circuit_state(self, counts: Dict[str, int], total: int) -> Dict[str, Any]:
+        """就绪率熔断（思路借自 CPA-Codex-Manager 的 emergency_defense）。
+
+        为什么需要它：批量掉号（上游事故、封号潮、IP 被封）时，**巡检自己**往往才是最大的破坏源——
+        它会把「集体失效」当成「这些号都该删」，一轮清掉半个池子，而其中很多号改天自己就恢复了。
+        所以当就绪率低于阈值时，本轮**直接放弃所有维护动作**，只出计划 + 告警，等人看一眼。
+
+        口径（与竞品的 `ready_count = total - 401 - quota - error` 一致）：
+
+            就绪 = 总数 - 需重登 - 额度耗尽
+
+        「冷却中」不算坏（等一会儿自己会好），「已禁用」也不是坏（那是人为关掉的）。
+        """
+        enabled = bool(self.config.get("inspector.circuit_breaker_enabled", True))
+        try:
+            threshold = float(self.config.get("inspector.min_ready_ratio") or 0.5)
+        except (TypeError, ValueError):
+            threshold = 0.5
+        broken = int(counts.get(STATE_UNAUTHORIZED, 0)) + int(counts.get(STATE_QUOTA_EXHAUSTED, 0))
+        total = int(total or 0)
+        ready = max(0, total - broken)
+        ratio = (ready / total) if total else 1.0
+        opened = enabled and total > 0 and ratio < threshold
+        return {
+            "enabled": enabled, "open": opened,
+            "ready": ready, "total": total,
+            "ready_ratio": round(ratio, 4), "threshold": threshold,
+            "reason": (f"就绪率 {ready}/{total} = {ratio:.0%}，低于阈值 {threshold:.0%}；"
+                       f"本轮放弃全部维护动作，避免集体失效时误删（冷却与已禁用不算坏）"
+                       if opened else ""),
+        }
 
     def _plan_for(self, item: Dict[str, Any], classified: Dict[str, Any],
                   row: Any) -> List[Dict[str, Any]]:
@@ -238,8 +293,19 @@ class AccountInspector:
             # 插件虚拟凭证不能直接改/删（上游明确拒绝）
             return planned
 
+        # 证据强度闸门：只有字段级证据（evidence_level=strong）才允许不可逆动作。
+        # 文案级证据（status_message 里一句 "429 too many requests"）默认只标记 + 告警 ——
+        # 想放开必须显式改 inspector.act_on_weak_evidence。
+        weak_evidence = (classified.get("evidence_level") or "strong") == "weak"
+        act_on_weak = as_bool(self.config.get("inspector.act_on_weak_evidence", False))
+        allow_hard = (not weak_evidence) or act_on_weak
+
         if state == STATE_UNAUTHORIZED:
-            if self.config.get("inspector.delete_unauthorized", False):
+            if not allow_hard:
+                planned.append({"action": ACTION_MARK, "name": name,
+                                "reason": (classified.get("reason") or "认证失效") +
+                                          "（只有文案证据，按配置仅标记）"})
+            elif self.config.get("inspector.delete_unauthorized", False):
                 planned.append({"action": ACTION_DELETE, "name": name,
                                 "reason": classified.get("reason") or "认证失效"})
             elif self.config.get("inspector.disable_unauthorized", False):
@@ -252,7 +318,11 @@ class AccountInspector:
                 planned.append({"action": ACTION_MARK, "name": name,
                                 "reason": classified.get("reason") or "认证失效"})
         elif state == STATE_QUOTA_EXHAUSTED:
-            if self.config.get("inspector.delete_quota_exhausted", False):
+            if not allow_hard:
+                planned.append({"action": ACTION_MARK, "name": name,
+                                "reason": (classified.get("reason") or "疑似额度耗尽") +
+                                          "（只有文案证据，按配置仅标记）"})
+            elif self.config.get("inspector.delete_quota_exhausted", False):
                 planned.append({"action": ACTION_DELETE, "name": name,
                                 "reason": "额度耗尽（按配置删除）"})
             elif self.config.get("inspector.disable_quota_exhausted", True):
@@ -286,11 +356,30 @@ class AccountInspector:
 
     # ------------------------------------------------------------------ 执行
 
+    @staticmethod
+    def _auth_index_of(action: Dict[str, Any]) -> str:
+        """从动作里拿 auth_index：优先看数据库行，其次看动作自带字段。
+
+        `sqlite3.Row` 对不存在的列会抛 IndexError（不是 KeyError），两个都要接。
+        """
+        row = action.get("_row")
+        if row is not None:
+            try:
+                index = str(row["auth_index"] or "")
+            except (KeyError, IndexError, TypeError):
+                index = ""
+            if index:
+                return index
+        return str(action.get("auth_index") or "")
+
     def _execute(self, client: CPAClient, action: Dict[str, Any]) -> tuple:
         name = action.get("name")
         if not name:
             return "skipped", "缺少凭证名"
         try:
+            if action["action"] == ACTION_MARK:
+                # 标记型动作：只写本地状态与告警，**绝不碰上游**
+                return "ok", "仅标记（未改动上游）"
             if action["action"] == ACTION_DISABLE:
                 client.patch_auth_file_status(name, disabled=True)
                 return "ok", "已禁用"
@@ -308,6 +397,12 @@ class AccountInspector:
                 # 语义 = 「不再参与调度，但保留凭证以便将来恢复」→ 上游动作就是禁用。
                 client.patch_auth_file_status(name, disabled=True)
                 return "ok", "已移入备用池（上游禁用 + 本地标记）"
+            if action["action"] == ACTION_COOLDOWN_RESET:
+                auth_index = self._auth_index_of(action)
+                if not auth_index:
+                    return "skipped", "缺少 auth_index（上游只认 auth_index，不认 name）"
+                client.reset_cooldown(auth_index)
+                return "ok", "已重置冷却"
         except CPAError as exc:
             if exc.management_unavailable:
                 raise
@@ -332,6 +427,10 @@ class AccountInspector:
             self.store.ex("UPDATE credentials SET disabled = 1 WHERE id = ?", (cred_id,))
         elif action["action"] == ACTION_DELETE:
             self.store.mark_credential_deleted(cred_id)
+        elif action["action"] == ACTION_COOLDOWN_RESET:
+            # 本地也要同步：否则面板还显示「冷却中」，与上游实际状态不一致
+            self.store.ex("UPDATE credentials SET next_retry_after = 0, unavailable = 0 "
+                          "WHERE id = ?", (cred_id,))
 
     # ------------------------------------------------------------------ 手动动作
 
@@ -343,6 +442,33 @@ class AccountInspector:
 
     def delete_credential(self, node_id: int, name: str) -> Dict[str, Any]:
         return self._manual(node_id, name, ACTION_DELETE)
+
+    def reset_cooldown_credential(self, node_id: int, name: str, auth_index: str) -> Dict[str, Any]:
+        """把冷却中的凭证立刻放回调度（走上游 `POST /routing/cooldown/reset`）。
+
+        上游只接受 auth_index（不是 name）—— 所以本地没同步到 auth_index 时必须**明说**，
+        而不是发一个上游会当成“空”的请求然后假装成功。
+        """
+        node = self.store.get_node(node_id)
+        if not node:
+            return {"ok": False, "error": "节点不存在"}
+        if not auth_index:
+            return {"ok": False, "error": "该凭证缺少 auth_index；上游只接受 auth_index"}
+        client = self._client(node)
+        try:
+            result = client.reset_cooldown(auth_index)
+        except CPAError as exc:
+            self.store.add_action(None, node_id, name, ACTION_COOLDOWN_RESET, "手动重置冷却",
+                                  "failed", str(exc))
+            return {"ok": False, "error": str(exc), "status": exc.status}
+        self.store.add_action(None, node_id, name, ACTION_COOLDOWN_RESET, "手动重置冷却", "ok", "")
+        row = self.store.q1("SELECT * FROM credentials WHERE node_id = ? AND name = ?",
+                            (node_id, name))
+        if row is not None:
+            self._apply_local_state(node_id, {"action": ACTION_COOLDOWN_RESET, "_row": row},
+                                    dry_run=False)
+        self.store.audit("credential.cooldown_reset", actor="user", target=name)
+        return {"ok": True, "result": result}
 
     def refresh_credential(self, node_id: int, name: str) -> Dict[str, Any]:
         node = self.store.get_node(node_id)
@@ -374,6 +500,17 @@ class AccountInspector:
         self.store.add_action(None, node_id, name, action, "手动操作", result, detail)
         self.store.audit(f"credential.{action}", actor="user", target=name, detail=detail)
         return {"ok": result == "ok", "result": result, "detail": detail}
+
+    def client_for(self, node_id: int) -> CPAClient:
+        """按节点 id 建客户端。
+
+        给 CLI 这类外部入口用（它们只拿到 `Panel`，没地方建客户端）。
+        面板侧走 `PanelApp.client`，但两者底层用的是同一个 `_client`。
+        """
+        node = self.store.get_node(int(node_id))
+        if node is None:
+            raise CPAError(f"节点不存在：{node_id}", status=404)
+        return self._client(node)
 
     def _client(self, node: Any) -> CPAClient:
         return CPAClient(
