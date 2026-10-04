@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 项目声明支持 3.9+，那就真的在两端都跑一遍
+        python-version: ["3.9", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 没有 pip install：项目零第三方依赖，这也是它能这样测的前提
+      - name: 单元 + 集成测试
+        run: python3 tests/run_all.py
+
+      - name: CLI 端到端冒烟
+        run: python3 tests/smoke_cli.py
+
+      # 文档里写的每个端点/路径/配置项都要在代码里找得到（只跑一次就够，放 3.13 上）
+      - name: 文档与代码一致性
+        if: matrix.python-version == '3.13'
+        run: python3 tests/check_docs.py
+
+      - name: 失败时上传详细日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-py${{ matrix.python-version }}
+          path: tests/_last_run.log
+          if-no-files-found: ignore

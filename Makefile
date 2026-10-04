@@ -6,7 +6,7 @@ CONFIG  ?= panel.config.json
 HOST    ?= 127.0.0.1
 PORT    ?= 18317
 
-.PHONY: help init serve collect inspect apply token test smoke check prune docker clean
+.PHONY: help init serve collect inspect apply token test smoke docs-check check prune docker clean
 
 help:            ## 显示所有可用目标
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -39,7 +39,10 @@ test:            ## 跑全部单元 + 集成测试
 smoke:           ## CLI 端到端冒烟（对着 Mock CPA 演练 init→collect→inspect→apply）
 	$(PY) tests/smoke_cli.py
 
-check: test smoke ## 提交前跑这一条就够了
+docs-check:      ## 文档与代码一致性（端点/上游路径/配置项都要能对上）
+	$(PY) tests/check_docs.py
+
+check: test smoke docs-check ## 提交前跑这一条就够了
 
 prune:           ## 清理过期数据（用量明细保留 180 天）
 	$(PY) -m cpapanel --config $(CONFIG) prune
