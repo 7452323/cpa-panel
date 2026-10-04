@@ -1,0 +1,39 @@
+# 运行数据（含数据库、日志、聚合）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# 本地配置与密钥：绝不入库
+panel.config.json
+*.config.json
+pricing.json
+.env
+
+# 临时/冒烟目录
+.smoke/
+.tmp/
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# 测试产物
+tests/_last_run.log
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 备份
+*.bak
+backups/

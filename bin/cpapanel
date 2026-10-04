@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""不依赖 `python -m` 的启动器。
+
+为什么需要它：`python -m cpapanel` 在少数受限环境里不可用
+（例如某些内嵌/常驻解释器不处理 `-m`，会直接挂住等待输入）。
+这时用 `python3 bin/cpapanel <命令>` 一样能跑全部功能。
+
+用法示例：
+    python3 bin/cpapanel init --node http://127.0.0.1:8317 --node-key sk-xxx
+    python3 bin/cpapanel serve --host 0.0.0.0 --port 18317
+    python3 bin/cpapanel inspect --apply
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from cpapanel.__main__ import main  # noqa: E402  （必须先修好 sys.path）
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

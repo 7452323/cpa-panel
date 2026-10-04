@@ -1,0 +1,56 @@
+[build-system]
+# 项目零第三方运行时依赖，但打包/安装仍走标准 PEP 517 流程。
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpa-panel"
+version = "0.1.0"
+description = "Self-hosted account management panel for CLIProxyAPI (CPA): usage collection, credential inventory, quota visibility and automated pool maintenance."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+keywords = ["cli-proxy-api", "cpa", "account-management", "usage", "openai", "claude", "codex"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Web Environment",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: Proxy Servers",
+  "Topic :: System :: Systems Administration",
+]
+# ★ 故意为空：运行时只用标准库（http.server / sqlite3 / urllib / threading）。
+dependencies = []
+
+[project.optional-dependencies]
+# 只有开发者可选装的东西；跑面板本身一个都不需要。
+dev = ["mypy>=1.8", "ruff>=0.5"]
+
+[project.urls]
+Homepage = "https://github.com/7452323/cpa-panel"
+Repository = "https://github.com/7452323/cpa-panel"
+Issues = "https://github.com/7452323/cpa-panel/issues"
+
+[project.scripts]
+cpa-panel = "cpapanel.__main__:main"
+
+[tool.setuptools]
+packages = ["cpapanel", "cpapanel.web"]
+
+[tool.setuptools.package-data]
+"cpapanel.web" = ["static/*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C4", "SIM", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_unused_ignores = true
+ignore_missing_imports = true
