@@ -1,242 +1,147 @@
-# 架构与数据模型
+# 架构
 
 ## 一句话
 
-单进程、零依赖、四个线程：**HTTP 服务 + 用量采集 + 账号巡检 + 你的浏览器**，中间隔着一个 SQLite。
+单进程 Python，三条线程（HTTP / 采集 / 巡检），一个 SQLite 文件，前端是一个没有构建步骤的内嵌单页。
 
-```mermaid
-flowchart TB
-  subgraph CPA["CLIProxyAPI 核心（上游）"]
-    MQ["usage queue<br/>消费型 · 60s TTL"]
-    CR["credentials / auth-files"]
-    CF["config / oauth / logs"]
-  end
+零第三方依赖是硬约束：目标机器上只需要一个 `python3`。
 
-  subgraph Panel["cpa-panel（单进程）"]
-    direction TB
-    COL["采集线程<br/>每 15s"]
-    INS["巡检线程<br/>每 15min"]
-    WEB["HTTP 服务<br/>ThreadingHTTPServer"]
-    NOT["通知<br/>Webhook / Telegram"]
-  end
+## 模块
 
-  DB[("SQLite<br/>panel.db")]
-  UI["浏览器<br/>内嵌 SPA"]
+| 模块 | 职责 |
+| --- | --- |
+| `cpapanel/config.py` | 配置默认值、加载与覆盖（`panel.config.json` + `CPAPANEL_*` 环境变量） |
+| `cpapanel/cpa.py` | **上游契约的唯一实现**：路径表（v0/v8）、前缀探测、鉴权、错误映射、所有上游调用 |
+| `cpapanel/models.py` | 数据归一化与**凭证状态判定**（六态 + 证据强度） |
+| `cpapanel/store.py` | SQLite 数据访问层（表结构、迁移、查询） |
+| `cpapanel/collector.py` | 用量采集线程：拉队列 → 落库 → 聚合 → 缺口检测 |
+| `cpapanel/inspector.py` | 巡检线程：快照 → 判定 → 计划 → **熔断闸门** → 执行 |
+| `cpapanel/notifier.py` | 告警通道（Webhook / Telegram），带事件白名单与去抖 |
+| `cpapanel/pricing.py` | 内置价格表 + 覆盖合并，费用估算 |
+| `cpapanel/security.py` | 口令哈希、令牌生成与校验 |
+| `cpapanel/runtime.py` | 组装（`build()`）与生命周期 |
+| `cpapanel/__main__.py` | CLI 入口（10 个子命令） |
+| `cpapanel/web/server.py` | HTTP 路由、鉴权、67 个面板端点、静态资源 |
+| `cpapanel/web/static/` | 内嵌单页 UI（`index.html` / `app.js` / `style.css`，无外链） |
+| `cpapanel/util.py`、`log.py`、`__init__.py` | 工具、日志、版本 |
 
-  COL -->|"POP count=50<br/>取走即删除"| MQ
-  COL -->|"幂等 upsert + 按天聚合"| DB
-  INS -->|"GET 全量快照"| CR
-  INS -->|"PATCH status / DELETE"| CR
-  INS -->|"快照差异 + 采样"| DB
-  WEB -->|"读"| DB
-  WEB -->|"代理操作"| CF
-  WEB -->|"写（会话/令牌 + CSRF）"| DB
-  UI <-->|"JSON API + 静态资源"| WEB
-  COL -.->|"数据丢失 / 失败"| NOT
-  INS -.->|"失效账号 / 低水位"| NOT
+依赖方向是单向的：`web` → `runtime` → (`collector`/`inspector`) → (`cpa`/`models`/`store`)。
+
+## 三条数据流
+
+### 1. 采集（`collector.py`，默认每 15 秒、每轮取 50 条）
+
+```
+GET /observability/usage/queue?count=N
+  → normalize_usage_record()   统一字段别名、拍平嵌套、判定错误、生成幂等键
+  → insert_usage_event()       幂等键冲突则跳过（重复采集不会重复计数）
+  → usage_daily                按天聚合（面板的趋势图读它，不扫明细）
+  → 缺口检测                    两次成功采集间隔 > 阈值 → collector.gap 告警
 ```
 
----
+**为什么必须秒级采**：上游队列是 `PopOldest` 语义 —— **取出即删，且约 60 秒后静默丢弃**。
+所以采集要么在跑，要么数据永久丢失（[upstream-api.md](upstream-api.md) 有完整说明）。
 
-## 目录职责
+### 2. 巡检（`inspector.py`，默认每 900 秒）
 
-| 模块 | 职责 | 不该做的事 |
-| --- | --- | --- |
-| `config.py` | 配置分层合并、路径解析、对外脱敏 | 不碰网络、不碰数据库 |
-| `store.py` | 唯一的数据出入口：建表/迁移/DAO | 不做业务判断（例如「什么算失效」） |
-| `cpa.py` | 上游 API 客户端：路径映射、鉴权、错误语义 | 不落库、不做自动决策 |
-| `models.py` | 归一化与状态机：原始数据 → 规范模型 | 不访问数据库与网络 |
-| `collector.py` | 采集循环：pop → 归一化 → 落库 → 间隙检测 | 不主动改上游 |
-| `inspector.py` | 巡检：分类 → 计划 → 执行 → 审计 | 不采集用量 |
-| `web/server.py` | HTTP 路由、鉴权、静态资源、指标 | 不直接写 SQL（走 store） |
-| `runtime.py` | 装配（CLI 与测试共用） | 不含业务逻辑 |
-
-这条边界不是洁癖：**端到端测试能跑通，正是因为它能拿同一份 `runtime.build()` 去组装一个真实的面板**，
-而不是去 mock 一堆内部函数。
-
----
-
-## 线程模型
-
-| 线程 | 频率 | 阻塞行为 |
-| --- | --- | --- |
-| HTTP（每请求一个线程） | 按需 | 调上游时最多阻塞 `http.read_timeout`（默认 20s） |
-| 采集 | 15s | 单轮失败只记日志，绝不让线程退出 |
-| 巡检 | 15min（启动后先等 30s，避免与应用启动抢资源） | 同上 |
-| （SQLite） | — | `check_same_thread=False` + 可重入锁；WAL 模式，读写不互相饿死 |
-
-**为什么采集必须比 60 秒快很多**：上游队列是消费型且 60 秒过期。
-如果采集间隔接近 60 秒，任何一次网络抖动都会导致永久丢数据。
-15 秒给了 4 倍的容错余量；即使连续 3 次失败，也还来得及。
-
----
-
-## 数据模型
-
-```mermaid
-erDiagram
-  nodes ||--o{ credentials : "拥有"
-  nodes ||--o{ usage_events : "产生"
-  nodes ||--o{ api_keys : "暴露"
-  credentials ||--o{ credential_samples : "巡检采样"
-  credentials ||--o{ credential_events : "变更事件"
-  nodes ||--o{ inspections : "巡检轮次"
-  inspections ||--o{ actions : "产生动作"
-  usage_events }o--|| usage_daily : "增量聚合"
-
-  nodes {
-    int id PK
-    text base_url
-    text management_key "明文存储，响应中掩码"
-    text api_prefix "auto|v0|v8"
-    text detected_prefix
-    int last_ok_at
-  }
-  credentials {
-    int id PK
-    int node_id FK
-    text name "上游凭证文件名"
-    text auth_index "上游稳定索引"
-    text provider
-    text status
-    text status_message
-    int disabled
-    int unavailable
-    int next_retry_after
-    int subscription_until
-    int standby "面板本地概念"
-    int present "消失记为 0，不删"
-    text raw_json "★ 原始留存"
-  }
-  usage_events {
-    int id PK
-    text dedupe_key UK "id:xxx 或 sha1:xxx"
-    int ts
-    text day
-    text model
-    text credential_index
-    text api_key
-    int input_tokens
-    int output_tokens
-    int reasoning_tokens
-    int cached_tokens
-    real cost_usd "估算"
-    int is_error
-    text raw_json "★ 原始留存"
-  }
-  usage_daily {
-    text day PK
-    int node_id PK
-    text model PK
-    text credential_index PK
-    int requests
-    real cost_usd
-  }
+```
+GET /credentials（分页取全量）
+  → sync_credentials()     新增 / 消失 / 状态变化 → credential_events
+  → classify_credential()  六态 + evidence_level（strong/weak）
+  → credential_samples     每次巡检都留一条观测，用于回溯「这个号什么时候开始坏的」
+  → _plan_for()            按状态与配置生成动作（disable/enable/delete/standby/promote/mark）
+  → _plan_pool()           备用池水位：目标数不足时从备用池补位
+  → 熔断闸门                 就绪率过低 → 本轮一项都不执行，只留计划
+  → 执行（仅 apply）         逐个动作 → actions 表 + 审计
+  → notifications           unauthorized / low_pool / circuit_open
 ```
 
-### 几个刻意的设计
+**dry-run 与 apply 走的是同一条代码路径**，唯一区别是 `allow_execute` 是否为真 ——
+这样「你看到的计划」和「真正执行的东西」不可能不一致。
 
-**1. `usage_events` 与 `usage_daily` 并存**
-明细用于「查一条具体请求」，日聚合用于「画图/排行」。
-聚合是**写入时增量累加**的，所以看报表不需要扫全表——
-面板要在手机上打开，不能每次点开就做一次全表 GROUP BY。
+### 3. 面板请求（`web/server.py`）
 
-**2. 凭证消失不删除，只标 `present = 0`**
-上游删掉一个凭证后，你依然需要能回答「它是什么时候消失的、消失前什么状态」。
-删除用户的历史账目是数据丢失的一种。
-
-**3. `raw_json` 到处都是**
-用量记录的字段名上游不保证，凭证条目上游会加字段。
-**归一化只影响「怎么展示」，原始数据才是「真相」**，所以两份都留。
-
-**4. `standby` 是本地面板的字段**
-上游没有「备用池」这个状态。移入备用池在上游表现为**禁用**，
-面板额外打本地标记，从而能在可用数低于目标时按顺序恢复。
-
----
-
-## 关键流程
-
-### 采集（每 15 秒）
-
-```mermaid
-sequenceDiagram
-  participant C as 采集线程
-  participant U as 上游队列
-  participant M as models
-  participant D as SQLite
-
-  C->>U: GET …/usage/queue?count=50
-  Note over U: 记录被取走 → 从队列删除
-  U-->>C: [记录...]（含控制帧）
-  loop 每条记录
-    C->>M: normalize_usage_record()
-    Note over M: 别名表归一化 + 保留原始 JSON<br/>控制帧返回 None 被跳过
-    C->>D: INSERT usage_events（ON UK 冲突 → 已存在）
-    C->>D: UPDATE usage_daily 增量累加
-  end
-  C->>D: 记录 last_success
-  alt 距上次成功 > 60s×3
-    C->>D: 审计 collector.gap（数据已丢）
-    C-->>C: 发告警
-  end
+```
+ThreadingHTTPServer
+  → @route 匹配（方法 + 正则）
+  → 鉴权：会话 Cookie（浏览器）或 Authorization: Bearer <面板令牌>（脚本）
+  → 写请求校验 X-CPA-Panel: 1        ← 简单而有效的 CSRF 防护
+  → handler → store / cpa client
 ```
 
-### 巡检（每 15 分钟，默认 dry-run）
+## 凭证状态机
 
-```mermaid
-flowchart LR
-  A["GET 全量凭证"] --> B["sync_credentials<br/>新增/消失/状态变化 → 事件"]
-  B --> C["逐条 classify_credential"]
-  C --> D{"默认 dry_run?"}
-  D -->|是| E["只产计划 + 落库 + 采样"]
-  D -->|否| F["执行动作<br/>禁用/删除/备用池/补位"]
-  E --> G["写 inspections / actions / audit"]
-  F --> G
-  G --> H["告警：需重登 / 低水位"]
+```
+                  ┌──────────────┐
+                  │  disabled    │←── 人工禁用（最高优先级，不再做其他判定）
+                  └──────────────┘
+    判定顺序 ↓
+   ┌────────────────┐   字段级/强文案    ┌────────────────┐
+   │  unauthorized  │←─────────────────│                │
+   └────────────────┘                  │                │
+   ┌────────────────┐   quota.signals  │ classify_      │
+   │ quota_exhausted│←─────────────────│ credential()   │
+   └────────────────┘                  │                │
+   ┌────────────────┐   unavailable +  │                │
+   │   cooling      │←── 未来时间点 ────│                │
+   └────────────────┘                  │                │
+   ┌────────────────┐   status=error   │                │
+   │    unknown     │←── 且原因未知 ────│                │
+   └────────────────┘                  └────────────────┘
+   ┌────────────────┐
+   │    healthy     │←── 以上都不命中
+   └────────────────┘
 ```
 
-**删除的三重护栏**：开关（默认关）+ 单轮上限（默认 20）+ 跳过 `runtime_only`（内存凭证，上游本就不允许直接改）。
-另外 `_execute` 对每个动作单独捕获异常——**一个动作失败不会中断整轮巡检**。
+判定结果附带 **`evidence_level`**：
 
-### 鉴权
+- `strong`：字段级证据 —— `status` 字段、结构化 `quota.signals`、订阅到期时间戳
+- `weak`：只有 `status_message` 里的关键词
 
-```mermaid
-flowchart TD
-  R["请求"] --> A{"有 Bearer?"}
-  A -->|是| T["查 panel_tokens<br/>SHA-256 摘要比对"]
-  A -->|否| C{"有会话 Cookie?"}
-  C -->|是| S["查 sessions<br/>校验过期时间"]
-  C -->|否| ANON["匿名"]
-  T --> W{"是写操作?"}
-  S --> W
-  W -->|是| CS{"X-CPA-Panel: 1 ?"}
-  CS -->|否| E403["403 CSRF"]
-  CS -->|是| OK["放行"]
-  W -->|否| OK
+巡检只对 `strong` 的号执行不可逆动作；`weak` 的只写 `mark` 动作 + 告警。
+另外，带瞬态词的文案（`timeout` / `connection` / `429` / `rate limit` / `502`…）
+永远不会被判成 `unauthorized` 或 `quota_exhausted`，而是归入 `cooling` 等它自愈。
+
+## 熔断
+
+```
+ready = 总数 - unauthorized - quota_exhausted      ← 冷却与已禁用不算「坏」
+ready_ratio = ready / 总数
+ready_ratio < inspector.min_ready_ratio（默认 0.5）  →  本轮放弃全部维护动作
 ```
 
-公开端点只有三个：`/api/health`、`/api/login`、`/api/session`（前端靠它判断是否已登录），以及 `/metrics`。
+它的目标不是「保护上游」，而是**保护你自己**：池子集体掉线时，
+自动巡检会把「集体失效」理解成「这些号都该删」，一轮就能清掉半个池子 ——
+而其中很多号只是被上游风控临时挡了，过几天就恢复。
 
----
+熔断触发时会写 `inspection.circuit_open` 审计与通知，巡检结果里 `mode = "circuit_break"`，CLI 输出的计划全部标记为「计划」而非「执行」。
 
-## 为什么用标准库
+## 数据库
 
-| 选择 | 理由 | 代价 |
-| --- | --- | --- |
-| `ThreadingHTTPServer` 而非 FastAPI/Flask | 面板是单人使用、并发极低；引入框架会把「部署」变成「配环境」 | 要自己写路由、鉴权、CSRF（约 900 行） |
-| `sqlite3` 而非 Postgres | 数据量小（每天几千条用量）、单机自托管、备份=复制一个文件 | 并发写靠锁，不适合多实例 |
-| `urllib` 而非 requests | 没有第三方依赖 | 要自己处理错误语义与 multipart |
-| 前端手写而非 React | 内网面板必须能离线加载，任何 CDN 都是故障点 | 前端代码更长，图表要自己画 SVG |
+`data/panel.db`（SQLite）。连接：`check_same_thread=False` + `timeout=15`，
+`journal_mode=WAL`、`synchronous=NORMAL`、`foreign_keys=ON`，所有写操作由一把 `RLock` 串行化 ——
+三条线程共用一个连接，简单但不会因为并发写而炸。
 
-这些取舍的目标只有一个：**`git clone` 之后 `python3 -m cpapanel serve` 就能跑**，
-不需要 pip、不需要 node、不需要构建。
+| 表 | 用途 |
+| --- | --- |
+| `users` / `sessions` / `panel_tokens` | 面板自身的账号、会话、API 令牌 |
+| `nodes` | 被管理的 CPA 节点（地址、管理密钥、前缀、启用状态） |
+| `credentials` | 凭证当前视图（含 `standby` 本地标记、`deleted` 软删标记） |
+| `credential_events` | 新增 / 消失 / 状态变化事件 |
+| `credential_samples` | 每次巡检的状态采样（回溯用） |
+| `usage_events` | 用量明细（幂等键去重；`prune` 默认保留 180 天） |
+| `usage_daily` | 按天聚合（趋势图数据源） |
+| `api_keys` / `key_usage` | 下游 Key 与按 Key 用量 |
+| `inspections` / `actions` | 巡检轮次与每次计划动作的结果 |
+| `audit` | 审计日志（所有写操作、危险操作、熔断） |
+| `settings` / `meta` | 运行时设置与元信息 |
 
----
+## 几个刻意的取舍
 
-## 扩展点
-
-- **换价格口径**：写 `pricing.json`（键为模型名前缀，USD / 1M tokens），把 `pricing_file` 指过去。
-- **加通知渠道**：`notify.py` 的 `Notifier.notify()` 里加一个分支即可（现有 webhook / telegram 两个参考实现）。
-- **加运维动作**：`inspector.py` 的 `_plan_for()`（决定做什么）+ `_execute()`（怎么打上游）一对函数。
-- **加数据表**：`store.py` 顶部的 `SCHEMA_STATEMENTS` 追加语句，并按需提升 `SCHEMA_VERSION`。
+| 决定 | 理由 |
+| --- | --- |
+| 不订阅上游的订阅通道 | 一旦有订阅者，上游就不再往队列里放记录 —— 面板会和用户其它工具抢数据 |
+| 单页 UI 无构建步骤 | 部署只需要 Python；改一行 JS 直接生效，不需要 node/npm |
+| 前端不用外链 CDN | 面板常在无外网的内网环境跑 |
+| 上游契约集中在一个文件 | 上游有两代前缀、多种请求体形状（裸数组/裸布尔），集中起来才可能配对 |
+| 判定与执行分离（计划 → 执行） | 让「机器判断」可被人审阅、可复现、可审计 |
