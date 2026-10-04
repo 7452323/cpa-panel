@@ -266,8 +266,11 @@
 
   /* ================================================================ 模态框 */
 
+  var pendingCloseHook = null;   // 关闭弹窗时的清理回调（同一时刻只可能有一个弹窗）
+
   function openModal(options) {
     options = options || {};
+    pendingCloseHook = typeof options.onClose === "function" ? options.onClose : null;
     var root = byId("modalRoot");
     var body = el("div", { class: "modal-body" });
     append(body, options.body);
@@ -304,9 +307,14 @@
   function closeModal() {
     var root = byId("modalRoot");
     if (!root) return;
+    var hook = pendingCloseHook;
+    pendingCloseHook = null;
     clear(root);
     root.hidden = true;
     document.body.classList.remove("modal-open");
+    if (hook) {
+      try { hook(); } catch (error) { /* 清理钩子不允许带崩界面 */ }
+    }
   }
 
   /** 带说明文字的二次确认（替代 window.confirm，便于把风险写清楚）。 */
@@ -422,7 +430,9 @@
       return el("div", { class: "table-wrap" }, [emptyRow(options.emptyText)]);
     }
     var head = el("thead", {}, [el("tr", {}, columns.map(function (column) {
-      return el("th", { class: column.class || "", text: column.title });
+      var cell = el("th", { class: column.class || "" });
+      append(cell, column.title);
+      return cell;
     }))]);
     var body = el("tbody", {}, rows.map(function (row, index) {
       return el("tr", { class: options.rowClass ? options.rowClass(row, index) : "" }, columns.map(function (column) {
@@ -623,6 +633,7 @@
   function onRoute() {
     clearTimers();
     closeModal();
+    document.body.classList.remove("batch-open");   // 离开凭证页时收起悬浮操作条的占位
     var rawHash = String(location.hash || "");
     if (rawHash && rawHash.slice(0, 2) !== "#/") return;   // 页内锚点（如跳过导航）不参与路由
     var route = parseHash();
@@ -785,6 +796,133 @@
     });
   }
 
+  var ACTION_LABELS = {
+    refresh: "刷新",
+    disable: "禁用",
+    enable: "启用",
+    delete: "删除",
+    standby: "移入备用池",
+    promote: "转出备用池",
+    reset_cooldown: "重置冷却"
+  };
+
+  var INSPECTION_MODES = {
+    dry_run: "仅计划（dry_run）",
+    apply: "实际执行（apply）",
+    circuit_break: "熔断拦截（circuit_break）"
+  };
+
+  /** 把后端返回的失败原因原样取出来（reset_cooldown 缺 auth_index 时原因在 error 字段）。 */
+  function detailText(result) {
+    if (result === null || result === undefined) return "未知原因";
+    if (typeof result === "string") return result;
+    if (result.error) return String(result.error);
+    if (result.detail) return typeof result.detail === "string" ? result.detail : truncate(JSON.stringify(result.detail), 200);
+    if (result.result !== undefined && result.result !== null && typeof result.result !== "object") return String(result.result);
+    if (result.result && typeof result.result === "object") return truncate(JSON.stringify(result.result), 200);
+    return "未知原因";
+  }
+
+  function isCooling(row) {
+    if (!row) return false;
+    if (row.state === "cooling") return true;
+    return !!row.next_retry_after && num(row.next_retry_after) * 1000 > Date.now();
+  }
+
+  /* ---------------------------------------------------------- 熔断（就绪率保护） */
+
+  function circuitSummary(circuit) {
+    if (!circuit || typeof circuit !== "object") return null;
+    var total = num(circuit.total);
+    var ready = num(circuit.ready);
+    var ratio = circuit.ready_ratio === null || circuit.ready_ratio === undefined
+      ? (total ? ready / total : 1) : num(circuit.ready_ratio);
+    return {
+      enabled: circuit.enabled === undefined ? true : !!circuit.enabled,
+      open: !!circuit.open,
+      ready: ready,
+      total: total,
+      ratio: ratio,
+      threshold: circuit.threshold === null || circuit.threshold === undefined ? 0.5 : num(circuit.threshold),
+      reason: circuit.reason || ""
+    };
+  }
+
+  /** 熔断横幅：open 或 mode=circuit_break 时给出醒目告警；熔断被关闭时给一行提醒。 */
+  function circuitBanner(circuit, mode) {
+    var info = circuitSummary(circuit);
+    if (info && (info.open || mode === "circuit_break")) {
+      return el("div", { class: "banner bad circuit", role: "alert" }, [
+        el("div", { class: "banner-title", text: "⛔ 熔断已触发：本轮未执行任何维护动作" }),
+        el("p", { text: "就绪率 " + fmtInt(info.ready) + "/" + fmtInt(info.total) + " = " + fmtPct(info.ratio) +
+                        "，低于阈值 " + fmtPct(info.threshold) + "，本轮未执行任何维护动作。" }),
+        el("p", { class: "banner-why", text: info.reason || "为避免集体掉号时误删，巡检已自动暂停全部维护动作。" }),
+        el("p", { class: "muted small", text: "就绪 = 总数 − 需重登 − 额度耗尽（冷却中与已禁用不算坏）。多为上游事故或封号潮，先人工确认账号状态再手动巡检。" })
+      ]);
+    }
+    if (!info && mode === "circuit_break") {
+      return el("div", { class: "banner bad circuit", role: "alert" }, [
+        el("div", { class: "banner-title", text: "⛔ 本轮巡检被熔断拦截，未执行任何维护动作" }),
+        el("p", { class: "muted small", text: "上游未返回熔断详情，请到「巡检与动作」页查看完整结果。" })
+      ]);
+    }
+    if (info && info.enabled === false) {
+      return el("div", { class: "banner warn" }, [
+        el("div", { class: "banner-title", text: "熔断保护已关闭" }),
+        el("p", { class: "muted small", text: "就绪率过低时不会自动暂停维护动作，集体掉号时存在误删风险（inspector.circuit_breaker_enabled = false）。" })
+      ]);
+    }
+    return null;
+  }
+
+  /** 从概览 / 巡检接口的返回里取最近一次巡检的 circuit + mode（内存快照优先，失败则回退历史）。 */
+  function lastInspectionCircuit(inspector) {
+    inspector = inspector || {};
+    var last = inspector.last || {};
+    if (last.circuit) return { circuit: last.circuit, mode: last.mode, at: last.finished_at || last.ts || null, node: last.node_name };
+    var recent = inspector.recent || inspector.inspections || [];
+    for (var i = 0; i < recent.length; i++) {
+      var summary = recent[i].summary || {};
+      if (summary.circuit) {
+        return { circuit: summary.circuit, mode: recent[i].mode, at: recent[i].finished_at || null, node: null };
+      }
+    }
+    return null;
+  }
+
+  /** 巡检结果里的熔断横幅（兼容单节点结果与 {nodes:[...]} 聚合结果）。 */
+  function circuitBannersFromRun(result) {
+    if (!result || typeof result !== "object") return [];
+    var nodes = Array.isArray(result.nodes) ? result.nodes : [result];
+    return nodes.map(function (node) {
+      if (!node || typeof node !== "object") return null;
+      var banner = circuitBanner(node.circuit, node.mode);
+      if (banner && node.node_name) {
+        append(banner, el("p", { class: "muted small", text: "节点：" + node.node_name }));
+      }
+      return banner;
+    }).filter(Boolean);
+  }
+
+  /** 巡检结果弹窗：熔断信息置顶，原始 JSON 在后。 */
+  function openInspectionResult(result) {
+    var nodes = (result && (Array.isArray(result.nodes) ? result.nodes : [result])) || [];
+    var modes = nodes.map(function (node) { return node && node.mode; }).filter(Boolean);
+    var body = circuitBannersFromRun(result);
+    if (modes.length) {
+      body = body.concat([el("p", { class: "row" }, modes.map(function (mode) {
+        return badge("本轮模式：" + (INSPECTION_MODES[mode] || mode), mode === "circuit_break" ? "bad" : (mode === "apply" ? "warn" : "info"));
+      }))]);
+    }
+    body = body.concat([jsonBlock(result)]);
+    openModal({
+      title: "巡检结果",
+      size: "wide",
+      body: body,
+      actions: [{ label: "关闭", onClick: function (close) { close(); } }]
+    });
+  }
+
   function collectorLine(snapshot) {
     var keys = Object.keys(snapshot || {});
     if (!keys.length) return "采集器暂无状态（可能未启用或尚未跑过一轮）";
@@ -819,7 +957,7 @@
       button("立即巡检", function () {
         send("POST", "/api/inspections/run", nodeQuery()).then(function (data) {
           toast("巡检完成", "ok");
-          openResultModal("巡检结果", data.result);
+          openInspectionResult(data.result);
         }).catch(reportError);
       })
     ]));
@@ -836,6 +974,13 @@
       var panel = data.panel || {};
       var database = panel.database || {};
       var inspector = data.inspector || {};
+
+      // 熔断横幅置顶：这是「本轮什么动作都没做」的致命信息，必须在概览一屏内可见
+      var circuitInfo = lastInspectionCircuit(inspector);
+      if (circuitInfo) {
+        var banner = circuitBanner(circuitInfo.circuit, circuitInfo.mode);
+        if (banner) body.appendChild(banner);
+      }
 
       var alerts = data.alerts || [];
       if (alerts.length) {
@@ -950,10 +1095,15 @@
 
   RENDER.credentials = function (host, params) {
     var filters = { provider: "", state: "", q: "", standby: "", include_removed: false };
+    var selected = {};      // id -> 名称（跨刷新保留，便于解释批量结果）
+    var visible = [];       // 当前列表里的行；全选/反选只作用于它们
     var stack = el("div", { class: "stack" });
     var summary = el("div", { class: "stack" });
     var listBox = el("div", { class: "stack" });
     var eventsBox = el("div", { class: "stack" });
+    var dangerBox = el("div", { class: "stack" });
+    var batchBar = el("div", { class: "batchbar", hidden: true });
+    var headerBox = input({ type: "checkbox", title: "全选 / 取消全选（仅当前列表）", "aria-label": "全选当前列表" });
 
     var providerSelect = select([{ value: "", label: "全部提供方" }], "", function () {
       filters.provider = providerSelect.value; load();
@@ -991,8 +1141,13 @@
     stack.appendChild(summary);
     stack.appendChild(listBox);
     stack.appendChild(eventsBox);
+    stack.appendChild(dangerBox);
     host.appendChild(stack);
+    host.appendChild(batchBar);
 
+    headerBox.addEventListener("change", function () { selectAllVisible(headerBox.checked); });
+    renderDangerZone();
+    renderBatchBar();
     summary.appendChild(loading());
     load();
 
@@ -1017,10 +1172,7 @@
           tile("错误", fmtInt(counts.erroring), null, "bad")
         ]));
         fillProviders(data.providers || []);
-        clear(listBox);
-        listBox.appendChild(card("凭证", dataTable(columns(), data.credentials || [], {
-          emptyText: "暂无凭证，先「同步」或「导入 JSON」"
-        }), { hint: "点击名称查看详情" }));
+        renderList(data.credentials || []);
       }).catch(function (error) {
         clear(summary);
         summary.appendChild(errorCard(error));
@@ -1043,6 +1195,18 @@
 
     function columns() {
       return [
+        {
+          title: headerBox,
+          class: "pick",
+          render: function (row) {
+            return el("label", { class: "field inline pick" }, [input({
+              type: "checkbox",
+              checked: isPicked(row),
+              "aria-label": "选择 " + (row.name || row.id),
+              onchange: function (event) { toggleRow(row, event.target.checked); }
+            })]);
+          }
+        },
         {
           title: "名称",
           render: function (row) {
@@ -1086,6 +1250,7 @@
               button(row.standby ? "恢复" : "备用", function () {
                 act(row, row.standby ? "promote" : "standby", row.standby ? "恢复" : "转备用");
               }, "tiny"),
+              isCooling(row) ? button("重置冷却", function () { act(row, "reset_cooldown", "重置冷却"); }, "tiny") : null,
               button("删除", function () {
                 confirmDialog("删除凭证", "将从上游删除 «" + row.name + "»，此操作不可撤销。", function () {
                   act(row, "delete", "删除");
@@ -1108,7 +1273,8 @@
     function act(row, action, label) {
       send("POST", "/api/credentials/" + row.id + "/action", { action: action }).then(function (result) {
         if (result && result.ok === false) {
-          toast(label + "失败：" + (result.detail || result.result || "未知原因"), "bad");
+          // 后端把原因放在 error（例如「该凭证缺少 auth_index」）→ 原样展示，不吞掉
+          toast(label + "失败：" + detailText(result), "bad");
         } else {
           toast(label + "成功：" + row.name, "ok");
         }
@@ -1121,6 +1287,152 @@
         toast("已同步 " + fmtInt(data.total) + " 条：+ " + fmtInt(data.added) + " / ~ " + fmtInt(data.changed) + " / - " + fmtInt(data.removed), "ok");
         load();
       }).catch(reportError);
+    }
+
+    /* ---------------------------------------------------------- 选择与批量 */
+
+    function isPicked(row) { return Object.prototype.hasOwnProperty.call(selected, String(row.id)); }
+    function selectedIds() { return Object.keys(selected).map(Number).sort(function (a, b) { return a - b; }); }
+
+    function renderList(rows) {
+      visible = rows || [];
+      clear(listBox);
+      listBox.appendChild(card("凭证（" + fmtInt(visible.length) + " 条）", dataTable(columns(), visible, {
+        emptyText: "暂无凭证，先「同步」或「导入 JSON」"
+      }), { hint: "勾选后可批量处理；点击名称查看详情" }));
+      updateHeaderBox();
+      renderBatchBar();   // 选中集可能在别处被清空（批量删除 / 清空全部），悬浮条必须跟着刷新
+    }
+
+    function updateHeaderBox() {
+      var picked = visible.filter(isPicked).length;
+      headerBox.checked = visible.length > 0 && picked === visible.length;
+      headerBox.indeterminate = picked > 0 && picked < visible.length;
+    }
+
+    function selectAllVisible(on) {
+      visible.forEach(function (row) {
+        if (on) selected[row.id] = row.name;
+        else delete selected[row.id];
+      });
+      renderList(visible);
+      renderBatchBar();
+    }
+
+    function invertSelection() {
+      visible.forEach(function (row) {
+        if (isPicked(row)) delete selected[row.id];
+        else selected[row.id] = row.name;
+      });
+      renderList(visible);
+      renderBatchBar();
+    }
+
+    function toggleRow(row, on) {
+      if (on) selected[row.id] = row.name;
+      else delete selected[row.id];
+      updateHeaderBox();
+      renderBatchBar();
+    }
+
+    /** 悬浮批量操作条：动作与后端 CREDENTIAL_ACTIONS 一一对应。 */
+    function renderBatchBar() {
+      var count = selectedIds().length;
+      clear(batchBar);
+      document.body.classList.toggle("batch-open", count > 0);
+      if (!count) { batchBar.hidden = true; return; }
+      batchBar.hidden = false;
+      append(batchBar, [
+        el("span", { class: "batch-count", text: "已选 " + fmtInt(count) + " 个" }),
+        el("div", { class: "row grow" }, [
+          button("启用", function () { runBatch("enable"); }, "tiny"),
+          button("禁用", function () { runBatch("disable"); }, "tiny"),
+          button("刷新", function () { runBatch("refresh"); }, "tiny"),
+          button("移入备用池", function () { runBatch("standby"); }, "tiny"),
+          button("转出备用池", function () { runBatch("promote"); }, "tiny"),
+          button("重置冷却", function () { runBatch("reset_cooldown"); }, "tiny"),
+          button("删除 " + fmtInt(count) + " 个", function () {
+            confirmDialog("批量删除 " + count + " 个凭证",
+              "将从上游删除已勾选的 " + count + " 个凭证，不可撤销。单次删除数量受 inspector.max_deletes_per_run 限制，超限时后端会拒绝并给出原因。",
+              function () { runBatch("delete"); }, "删除 " + count + " 个");
+          }, "tiny danger"),
+          button("反选", invertSelection, "tiny"),
+          button("取消选择", function () { selected = {}; renderList(visible); renderBatchBar(); }, "tiny ghost")
+        ])
+      ]);
+    }
+
+    function runBatch(action) {
+      var ids = selectedIds();
+      if (!ids.length) { toast("请先勾选凭证", "warn"); return; }
+      var label = ACTION_LABELS[action] || action;
+      toast("正在批量" + label + "（" + ids.length + " 个）…", "info");
+      send("POST", "/api/credentials/batch", { action: action, ids: ids }).then(function (data) {
+        openBatchResult(action, data);
+        var results = (data && data.results) || [];
+        var failed = results.filter(function (item) { return !item.ok; }).length;
+        if (!failed) toast("批量" + label + "全部成功（" + fmtInt(data.succeeded) + " 个）", "ok");
+        else toast("批量" + label + "：成功 " + fmtInt(data.succeeded) + " / 失败 " + fmtInt(failed), "warn");
+        if (action === "delete") selected = {};
+        load();
+      }).catch(reportError);
+    }
+
+    /** 逐项展示批量结果：谁成功、谁失败、失败原因。 */
+    function openBatchResult(action, data) {
+      var results = (data && data.results) || [];
+      var failed = results.filter(function (item) { return !item.ok; });
+      openModal({
+        title: "批量" + (ACTION_LABELS[action] || action) + "结果",
+        size: "wide",
+        body: [
+          el("div", { class: "row" }, [
+            badge("请求 " + fmtInt(data.requested), "muted"),
+            badge("成功 " + fmtInt(data.succeeded), "ok"),
+            badge("失败 " + fmtInt(failed.length), failed.length ? "bad" : "muted")
+          ]),
+          dataTable([
+            { title: "凭证", render: function (row) { return truncate(row.name || "(未知)", 34) + " · #" + row.id; } },
+            { title: "结果", render: function (row) { return row.ok ? badge("成功", "ok") : badge("失败", "bad"); } },
+            { title: "说明", render: function (row) { return row.ok ? "—" : detailText(row); } }
+          ], results, { emptyText: "后端未返回逐项结果" }),
+          failed.length ? hint("失败项不影响其余凭证；修正后可单独重试。") : null
+        ],
+        actions: [{ label: "关闭", onClick: function (close) { close(); } }]
+      });
+    }
+
+    /* ---------------------------------------------------------- 危险区 */
+
+    function renderDangerZone() {
+      var phrase = input({ type: "text", placeholder: "DELETE-ALL", autocomplete: "off", spellcheck: "false" });
+      var runButton = el("button", { class: "btn danger", type: "button", text: "清空全部凭证", disabled: true });
+      phrase.addEventListener("input", function () {
+        // 与后端一致：strip() 后精确比较
+        runButton.disabled = phrase.value.trim() !== "DELETE-ALL";
+      });
+      runButton.addEventListener("click", function () {
+        confirmDialog("清空上游全部凭证",
+          "这会调用上游 DELETE /credentials?all=true，删掉该节点上的所有凭证（含备用池里的号）。不可恢复、没有数量上限，也不受单次删除上限保护，只能靠重新登录或重新导入恢复。",
+          function () {
+            send("POST", "/api/credentials/delete-all", withNode({ confirm: "DELETE-ALL" })).then(function (data) {
+              toast("已清空节点 #" + data.node_id + " 的全部凭证", "warn");
+              selected = {};
+              openResultModal("清空结果", data.result);
+              loadNodes();
+              load();
+            }).catch(reportError);
+          }, "确认清空全部");
+      });
+      clear(dangerBox);
+      dangerBox.appendChild(el("section", { class: "card danger-zone" }, [
+        el("header", { class: "card-head" }, [el("h2", { text: "危险区 · 清空全部凭证" })]),
+        el("div", { class: "card-body stack" }, [
+          el("p", { text: "该操作会删除当前节点上游的全部凭证，不可撤销，且不受单次删除上限保护。请先确认已有备份或导出。" }),
+          el("p", { class: "muted small", text: "确认方式：在下方原样输入 DELETE-ALL（区分大小写）后，按钮才会启用。" }),
+          el("div", { class: "filters" }, [field("确认词", phrase), runButton])
+        ])
+      ]));
     }
 
     function loadEvents() {
@@ -1255,16 +1567,29 @@
       var providerSelect = select(OAUTH_PROVIDERS.map(function (name) { return { value: name, label: name }; }), "codex", null);
       var statusBox = el("div", { class: "stack" });
       var pollId = null;
+      var pendingState = "";   // 本次 OAuth 会话的 state；关闭弹窗时要把上游的 pending session 也撤掉
       function stopPoll() { if (pollId) { clearInterval(pollId); pollId = null; } }
+      function cancelPendingSession(silent) {
+        stopPoll();
+        var state = pendingState;
+        pendingState = "";
+        if (!state) return;
+        send("DELETE", "/api/oauth/session", {}, { state: state }).then(function () {
+          if (!silent) toast("已取消本次登录会话", "info");
+        }).catch(function () { /* 撤销失败不打扰；上游会自行过期 */ });
+      }
+      function cancelSession(close) { cancelPendingSession(false); close(); }
       openModal({
         title: "新增登录（OAuth）",
+        // 无论按钮、✕、Esc 还是点遮罩关闭，都要把上游那个 pending session 撤掉
+        onClose: function () { cancelPendingSession(true); },
         body: [
           hint("由上游生成授权链接；在浏览器里完成登录后，本面板会自动轮询状态。"),
           field("提供方", providerSelect),
           statusBox
         ],
         actions: [
-          { label: "取消", onClick: function (close) { stopPoll(); close(); } },
+          { label: "取消", onClick: function (close) { cancelSession(close); } },
           {
             label: "生成链接", tone: "primary",
             onClick: function () {
@@ -1273,6 +1598,7 @@
               statusBox.appendChild(loading("请求中…"));
               send("POST", "/api/oauth/start", withNode({ provider: providerSelect.value })).then(function (data) {
                 var state = data.state || "";
+                pendingState = state;
                 var url = data.url || data.auth_url || "";
                 clear(statusBox);
                 var statusLine = el("p", { class: "muted small", text: "状态：等待授权…" });
@@ -1287,6 +1613,7 @@
                     statusLine.textContent = "状态：" + status;
                     if (["ok", "success", "done"].indexOf(status.toLowerCase()) >= 0) {
                       stopPoll();
+                      pendingState = "";   // 已完成，不再需要撤销上游会话
                       toast("授权成功", "ok");
                       load();
                     } else if (status.toLowerCase() === "error") {
@@ -1800,7 +2127,7 @@
       if (modeSelect.value === "false") payload.dry_run = false;
       send("POST", "/api/inspections/run", payload).then(function (data) {
         toast("巡检完成", "ok");
-        openResultModal("巡检结果", data.result);
+        openInspectionResult(data.result);
         load();
       }).catch(reportError);
     }
@@ -1812,6 +2139,20 @@
         var last = data.last || {};
         var latest = rows[0] || {};
         var parts = [];
+        var circuitInfo = lastInspectionCircuit({ last: last, recent: rows });
+        if (circuitInfo) {
+          var banner = circuitBanner(circuitInfo.circuit, circuitInfo.mode);
+          if (banner) parts.push(banner);
+        }
+        var lastInfo = circuitSummary(last.circuit);
+        if (lastInfo) {
+          parts.push(el("p", { class: "row" }, [
+            last.mode ? badge("最近一轮模式：" + (INSPECTION_MODES[last.mode] || last.mode), last.mode === "circuit_break" ? "bad" : (last.mode === "apply" ? "warn" : "info")) : null,
+            badge("就绪率 " + fmtInt(lastInfo.ready) + "/" + fmtInt(lastInfo.total) + " = " + fmtPct(lastInfo.ratio), lastInfo.open ? "bad" : "ok"),
+            badge("阈值 " + fmtPct(lastInfo.threshold), "muted"),
+            badge(lastInfo.enabled ? "熔断保护：开" : "熔断保护：关", lastInfo.enabled ? "info" : "warn")
+          ]));
+        }
         if (rows.length) {
           parts.push(tiles([
             tile("扫描", fmtInt(latest.scanned)),
@@ -1832,10 +2173,29 @@
           { title: "结束", render: function (row) { return row.finished_at ? fmtTs(row.finished_at, true) : badge("进行中", "info"); } },
           { title: "扫描/活跃", class: "num", render: function (row) { return fmtInt(row.scanned) + " / " + fmtInt(row.active); } },
           { title: "计划/执行/失败", class: "num", render: function (row) { return fmtInt(row.planned) + " / " + fmtInt(row.executed) + " / " + fmtInt(row.failures); } },
+          {
+            title: "熔断",
+            render: function (row) {
+              var info = circuitSummary((row.summary || {}).circuit);
+              if (!info) return "—";
+              return info.open
+                ? badge("已触发 " + fmtPct(info.ratio) + " < " + fmtPct(info.threshold), "bad")
+                : badge("就绪 " + fmtPct(info.ratio), "ok");
+            }
+          },
           { title: "错误", render: function (row) { return row.error ? el("span", { class: "muted small", text: truncate(row.error, 40) }) : "—"; } },
           {
             title: "摘要", class: "actions",
-            render: function (row) { return button("查看", function () { openResultModal("巡检 #" + row.id + " 摘要", row.summary || {}); }, "tiny"); }
+            render: function (row) {
+              return button("查看", function () {
+                openModal({
+                  title: "巡检 #" + row.id + " 摘要",
+                  size: "wide",
+                  body: [circuitBanner((row.summary || {}).circuit, null), jsonBlock(row.summary || {})].filter(Boolean),
+                  actions: [{ label: "关闭", onClick: function (close) { close(); } }]
+                });
+              }, "tiny");
+            }
           }
         ], rows, { emptyText: "暂无巡检记录" })));
       }).catch(function (error) { mount(snapshotBox, errorCard(error)); });
@@ -1891,7 +2251,15 @@
           ], { hint: "上游 quota/providers" }),
           card("凭证配额", dataTable([
             { title: "凭证", render: function (row) { return truncate(row.name || "—", 28); } },
-            { title: "提供方", render: function (row) { return row.provider || "—"; } },
+            {
+              title: "提供方",
+              render: function (row) {
+                var label = row.provider || "—";
+                return row.quota_provider
+                  ? el("span", {}, [label + " ", badge("配额源 " + row.quota_provider, "info")])
+                  : label;
+              }
+            },
             { title: "状态", render: function (row) { return stateBadge(row.state); } },
             { title: "支持主动查询", render: function (row) { return row.supports_quota ? badge("是", "ok") : badge("否", "muted"); } },
             { title: "信号", render: function (row) { return row.quota ? el("span", { class: "muted small", text: truncate(JSON.stringify(row.quota), 60) }) : "—"; } },
@@ -2065,6 +2433,14 @@
     { key: "inspector.enabled", label: "启用巡检", type: "bool" },
     { key: "inspector.interval_seconds", label: "巡检间隔（秒）", type: "number" },
     { key: "inspector.dry_run", label: "仅计划（dry_run）", type: "bool" },
+    {
+      key: "inspector.circuit_breaker_enabled", label: "就绪率熔断保护", type: "bool",
+      help: "就绪率低于阈值时自动暂停所有维护动作，避免集体掉号时误删"
+    },
+    {
+      key: "inspector.min_ready_ratio", label: "熔断阈值（就绪率 %）", type: "percent",
+      help: "就绪率低于该比例时自动暂停所有维护动作，避免集体掉号时误删；就绪 = 总数 − 需重登 − 额度耗尽（冷却与已禁用不算坏）"
+    },
     { key: "inspector.disable_unauthorized", label: "自动禁用失效账号", type: "bool" },
     { key: "inspector.disable_quota_exhausted", label: "自动禁用额度耗尽账号", type: "bool" },
     { key: "inspector.delete_unauthorized", label: "自动删除失效账号（危险）", type: "bool" },
@@ -2201,7 +2577,14 @@
           });
           if (!Object.keys(payload).length) { toast("没有检测到修改", "info"); return; }
           send("PUT", "/api/config", payload).then(function (result) {
-            toast("已应用 " + Object.keys((result && result.applied) || payload).length + " 项配置", "ok");
+            var applied = (result && result.applied) || {};
+            var appliedKeys = Object.keys(applied);
+            var rejected = Object.keys(payload).filter(function (key) { return appliedKeys.indexOf(key) < 0; });
+            if (appliedKeys.length) toast("已应用 " + appliedKeys.length + " 项配置", "ok");
+            if (rejected.length) {
+              // PUT /api/config 有白名单：不在白名单的字段会被静默忽略，这里必须说出来
+              toast("后端未接受：" + rejected.join("、") + "（不在 /api/config 白名单内，改动未生效）", "bad");
+            }
             loadConfig();
           }).catch(reportError);
         }
@@ -2209,6 +2592,16 @@
     }
 
     function buildConfigControl(spec, config) {
+      var control = buildConfigInput(spec, config);
+      if (spec.help) {
+        var wrap = el("div", { class: "stack", style: { gap: "2px" } });
+        append(wrap, [control.node, el("p", { class: "muted small", text: spec.help })]);
+        control.node = wrap;
+      }
+      return control;
+    }
+
+    function buildConfigInput(spec, config) {
       var original = dig(config, spec.key);
       var node;
       if (spec.type === "bool") {
@@ -2237,6 +2630,19 @@
           placeholder: original ? "已设置（" + original + "），留空保持不变" : "未设置"
         });
         return { key: spec.key, type: spec.type, original: original, node: field(spec.label, secret), read: function () { return secret.value.trim(); } };
+      }
+      if (spec.type === "percent") {
+        // 后端存 0~1 的小数，面板按百分比展示（留空 = 不修改）
+        var shown = original === null || original === undefined ? "" : String(Math.round(num(original) * 1000) / 10);
+        var percent = input({ type: "number", step: "1", min: "0", max: "100", value: shown });
+        return {
+          key: spec.key, type: "percent", original: original, node: field(spec.label, percent),
+          read: function () {
+            if (percent.value === "") return undefined;
+            var parsed = Number(percent.value);
+            return isFinite(parsed) ? parsed / 100 : undefined;
+          }
+        };
       }
       var text = input({ type: "text", value: original === null || original === undefined ? "" : String(original) });
       return { key: spec.key, type: "text", original: original, node: field(spec.label, text), read: function () { return text.value.trim(); } };

@@ -255,6 +255,7 @@ a:hover { text-decoration: underline; }
 .tile.warn .tile-value { color: var(--warn); }
 .tile.bad .tile-value { color: var(--bad); }
 .tile.info .tile-value { color: var(--info); }
+.tile-sub { margin-top: 2px; }
 
 .kv { margin: 0; display: grid; gap: 6px; }
 .kv-row { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 10px; }
@@ -374,6 +375,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 .legend { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .legend li { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .legend .dot { width: 10px; height: 10px; border-radius: 3px; flex: 0 0 auto; }
+.legend .legend-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .legend-value { margin-left: auto; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 .donut-wrap { display: flex; flex-direction: column; align-items: center; }
 .donut-wrap svg { max-width: 200px; }
@@ -448,7 +450,59 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   .page-actions { margin-left: 0; width: 100%; }
 }
 
+/* ---------------------------------------------------------------- 批量选择与操作条 */
+
+.table .pick, .table th.pick { width: 36px; text-align: center; padding-left: 6px; padding-right: 6px; }
+.table .pick input { margin: 0; }
+.field.pick { flex-direction: row; align-items: center; gap: 0; }
+.field.pick > span { display: none; }
+
+.batchbar {
+  position: fixed; z-index: 55;
+  left: 50%; transform: translateX(-50%);
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  width: min(96vw, 1020px);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lift);
+}
+.batchbar[hidden] { display: none; }
+.batchbar .batch-count { font-weight: 600; white-space: nowrap; }
+.batchbar .row { gap: 6px; }
+body.batch-open .toasts { bottom: calc(104px + env(safe-area-inset-bottom)); }
+/* 悬浮条会盖住列表最后几行，选中时给主区域留出空间 */
+body.batch-open .view { padding-bottom: calc(148px + env(safe-area-inset-bottom)); }
+
+/* ---------------------------------------------------------------- 熔断横幅 */
+
+.banner {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+}
+.banner-title { font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+.banner .banner-why { font-weight: 500; }
+.banner.bad { border-color: var(--bad); background: var(--bad-bg); }
+.banner.bad .banner-title { color: var(--bad); }
+.banner.warn { border-color: var(--warn); background: var(--warn-bg); }
+.banner.warn .banner-title { color: var(--warn); }
+.banner.circuit { border-width: 2px; }
+
+/* ---------------------------------------------------------------- 危险区 */
+
+.card.danger-zone { border-color: var(--bad); }
+.card.danger-zone .card-head { background: var(--bad-bg); border-bottom-color: var(--bad); }
+.card.danger-zone .card-head h2 { color: var(--bad); }
+.btn.danger:disabled { opacity: 0.45; cursor: default; }
+.btn.danger:not(:disabled):hover { background: var(--bad-bg); }
+
 @media print {
-  .topbar, .sidebar, .toasts, .page-actions { display: none !important; }
+  .topbar, .sidebar, .toasts, .page-actions, .batchbar { display: none !important; }
   .card { box-shadow: none; }
 }

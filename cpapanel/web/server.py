@@ -572,6 +572,43 @@ def credential_update(app: PanelApp, req: Request) -> Any:
     return {"ok": True, "pushed": pushed}
 
 
+CREDENTIAL_ACTIONS = ("refresh", "disable", "enable", "delete", "standby", "promote",
+                     "reset_cooldown")
+
+
+def _run_credential_action(app: PanelApp, row: Any, action: str) -> Dict[str, Any]:
+    """对单个凭证执行一个动作。
+
+    单发（`/action`）与批量（`/batch`）共用这一份实现 —— 否则两条路的语义迟会漂，
+    而“单点能用、批量偷偷不一样”是这类面板最难查的 bug。
+    """
+    cred_id = int(row["id"])
+    node_id, name = int(row["node_id"]), row["name"]
+    if action == "refresh":
+        return app.inspector.refresh_credential(node_id, name)
+    if action == "disable":
+        return app.inspector.disable_credential(node_id, name)
+    if action == "enable":
+        return app.inspector.enable_credential(node_id, name)
+    if action == "delete":
+        return app.inspector.delete_credential(node_id, name)
+    if action == "standby":
+        result = app.inspector._manual(node_id, name, "standby")
+        if result.get("ok"):
+            app.store.set_credential_standby(cred_id, True)
+        return result
+    if action == "promote":
+        result = app.inspector._manual(node_id, name, "promote")
+        if result.get("ok"):
+            app.store.set_credential_standby(cred_id, False)
+        return result
+    if action == "reset_cooldown":
+        # 上游只认 auth_index（不是 name）；本地缺 auth_index 时会让用户看到原因
+        return app.inspector.reset_cooldown_credential(node_id, name,
+                                                       str(row["auth_index"] or ""))
+    raise ApiError(f"未知动作：{action}", 400)
+
+
 @route("POST", r"/api/credentials/(?P<cred_id>\d+)/action")
 def credential_action(app: PanelApp, req: Request) -> Any:
     cred_id = int(req.path_params["cred_id"])
@@ -579,28 +616,86 @@ def credential_action(app: PanelApp, req: Request) -> Any:
     if not row:
         raise ApiError("凭证不存在", 404)
     action = str(req.json().get("action") or "").strip().lower()
-    node_id, name = int(row["node_id"]), row["name"]
-    if action == "refresh":
-        result = app.inspector.refresh_credential(node_id, name)
-    elif action == "disable":
-        result = app.inspector.disable_credential(node_id, name)
-    elif action == "enable":
-        result = app.inspector.enable_credential(node_id, name)
-    elif action == "delete":
-        result = app.inspector.delete_credential(node_id, name)
-    elif action == "standby":
-        result = app.inspector._manual(node_id, name, "standby")
-        if result.get("ok"):
-            app.store.set_credential_standby(cred_id, True)
-    elif action == "promote":
-        result = app.inspector._manual(node_id, name, "promote")
-        if result.get("ok"):
-            app.store.set_credential_standby(cred_id, False)
-    else:
-        raise ApiError("未知动作", 400)
-    app.store.audit(f"credential.{action}", actor=req.user or "?", target=name,
+    result = _run_credential_action(app, row, action)
+    app.store.audit(f"credential.{action}", actor=req.user or "?", target=row["name"],
                     detail=short(jdump(result), 300), ip=req.client_ip)
     return result
+
+
+@route("POST", r"/api/credentials/batch")
+def credentials_batch(app: PanelApp, req: Request) -> Any:
+    """批量操作（面板上勾一批号一次处理）。
+
+    两个刻意的设计：
+      1. `delete` 受 `inspector.max_deletes_per_run` 限制 —— 巡检的单轮删除上限
+         不能因为“手点一下”就绕过，否则那个闸门形同虚设；
+      2. 批量**不含**清空全部，那个必须走 `/delete-all` 并输入确认词。
+    每项都单独返回结果：一个号失败不应该把整批标成失败，也不应该让剩下的悄悄不执行。
+    """
+    data = req.json()
+    action = str(data.get("action") or "").strip().lower()
+    ids = data.get("ids") or []
+    if action not in CREDENTIAL_ACTIONS:
+        raise ApiError(f"未知动作：{action}；可选：{', '.join(CREDENTIAL_ACTIONS)}", 400)
+    if not isinstance(ids, list) or not ids:
+        raise ApiError("ids 必须是非空数组", 400)
+    max_items = 200
+    if len(ids) > max_items:
+        raise ApiError(f"一次最多处理 {max_items} 个", 400)
+    if action == "delete":
+        limit = int(app.config.get("inspector.max_deletes_per_run") or 20)
+        if len(ids) > limit:
+            raise ApiError(
+                f"单次最多删除 {limit} 个（与巡检的 inspector.max_deletes_per_run 一致）", 400)
+
+    results: List[Dict[str, Any]] = []
+    for raw_id in ids:
+        try:
+            cred_id = int(raw_id)
+        except (TypeError, ValueError):
+            results.append({"id": raw_id, "ok": False, "error": "id 不是数字"})
+            continue
+        row = app.store.get_credential(cred_id)
+        if not row:
+            results.append({"id": cred_id, "ok": False, "error": "凭证不存在"})
+            continue
+        try:
+            outcome = _run_credential_action(app, row, action)
+        except ApiError as exc:
+            outcome = {"ok": False, "error": str(exc)}
+        results.append({"id": cred_id, "name": row["name"], **outcome})
+
+    succeeded = sum(1 for item in results if item.get("ok"))
+    app.store.audit(f"credential.batch.{action}", actor=req.user or "?",
+                    target=f"{succeeded}/{len(results)}", ip=req.client_ip)
+    return {"ok": succeeded == len(results), "action": action,
+            "requested": len(ids), "succeeded": succeeded, "results": results}
+
+
+@route("POST", r"/api/credentials/delete-all")
+def credentials_delete_all(app: PanelApp, req: Request) -> Any:
+    """清空上游全部凭证（官方：`DELETE /credentials?all=true`）。
+
+    这是本项目**唯一一个不可逆且没有数量上限**的动作，所以：
+      * 必须带上确认词 `DELETE-ALL`（防误触、防前端按钮点错）；
+      * 不受单轮删除上限保护 —— 因此只能由人明确触发，巡检永远不会调它；
+      * 强制写审计，记下是谁在什么时候清的。
+    """
+    try:
+        data = req.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict) or str(data.get("confirm") or "").strip() != "DELETE-ALL":
+        raise ApiError("危险操作：请在 confirm 字段里原样输入 DELETE-ALL", 400)
+    node_id = as_int(data.get("node_id")) or (app.store.list_nodes(only_enabled=True)[0]["id"]
+                                              if app.store.list_nodes(only_enabled=True) else None)
+    if not node_id:
+        raise ApiError("尚未配置任何 CPA 节点", 400)
+    client = app.client(node_id)
+    result = client.delete_all_auth_files()
+    app.store.audit("credential.delete_all", actor=req.user or "?", target=f"node={node_id}",
+                    detail=short(jdump(result), 300), ip=req.client_ip)
+    return {"ok": True, "node_id": node_id, "result": result}
 
 
 @route("GET", r"/api/credentials/(?P<cred_id>\d+)/models")
@@ -918,6 +1013,9 @@ def panel_config_update(app: PanelApp, req: Request) -> Any:
         "inspector.delete_unauthorized", "inspector.delete_quota_exhausted",
         "inspector.max_deletes_per_run", "inspector.standby_pool", "inspector.target_active",
         "inspector.promote_standby_when_low",
+        # 安全闸门：必须可调，否则 UI 里改了也会被这里静默忽略
+        "inspector.circuit_breaker_enabled", "inspector.min_ready_ratio",
+        "inspector.act_on_weak_evidence",
         "notify.webhook_url", "notify.telegram_bot_token", "notify.telegram_chat_id",
         "notify.min_interval_seconds",
     }
@@ -926,10 +1024,13 @@ def panel_config_update(app: PanelApp, req: Request) -> Any:
         if key not in allowed:
             continue
         if key.startswith("inspector.") or key.startswith("collector."):
+            # 布尔类的后缀：注意 circuit_breaker_enabled / act_on_weak_evidence
+            # 不以 ".enabled" 结尾，必须单独列出来 —— 否则传字符串 "false" 会被当成真值。
             if key.endswith((".enabled", ".dry_run", ".disable_unauthorized",
                              ".disable_quota_exhausted", ".delete_unauthorized",
                              ".delete_quota_exhausted", ".standby_pool",
-                             ".promote_standby_when_low")):
+                             ".promote_standby_when_low",
+                             "circuit_breaker_enabled", "act_on_weak_evidence")):
                 value = as_bool(value)
             elif key.endswith(("seconds", "batch_size", "max_deletes_per_run", "target_active")):
                 value = as_int(value) or 0
@@ -973,6 +1074,103 @@ def upstream_config_yaml_put(app: PanelApp, req: Request) -> Any:
     app.store.audit("upstream.config_replaced", actor=req.user or "?", ip=req.client_ip,
                     detail=f"{len(text)} bytes")
     return {"ok": True, "bytes": len(text)}
+
+
+# --- OAuth 模型排除 / 模型别名
+# 上游只提供“整张 map 一起 PUT”，没有单条增删接口 —— 所以面板做读-改-写，
+# UI 只需表达“某个渠道排除哪些模型”。
+# 不这么做的话，改一个渠道会把其它渠道的配置静默清空。
+
+
+@route("GET", r"/api/upstream/oauth-excluded-models")
+def upstream_excluded_models(app: PanelApp, req: Request) -> Any:
+    return {"providers": app.client(req.qi("node_id")).get_oauth_excluded_models()}
+
+
+@route("POST", r"/api/upstream/oauth-excluded-models")
+def upstream_excluded_models_set(app: PanelApp, req: Request) -> Any:
+    """设置某个渠道「不接的模型」；传空数组 = 删除该渠道的条目。"""
+    data = req.json()
+    provider = str(data.get("provider") or "").strip()
+    if not provider:
+        raise ApiError("provider 必填", 400)
+    models = data.get("models")
+    if not isinstance(models, list):
+        raise ApiError("models 必须是数组（空数组表示删除该渠道）", 400)
+    client = app.client(as_int(data.get("node_id")))
+    mapping = client.get_oauth_excluded_models()
+    before = mapping.get(provider)
+    cleaned = [str(m).strip() for m in models if str(m).strip()]
+    if cleaned:
+        mapping[provider] = cleaned
+    else:
+        mapping.pop(provider, None)
+    client.put_oauth_excluded_models(mapping)
+    app.store.audit("upstream.oauth_excluded_models", actor=req.user or "?", target=provider,
+                    detail=short(jdump({"before": before, "after": cleaned}), 300),
+                    ip=req.client_ip)
+    return {"ok": True, "provider": provider, "models": cleaned, "providers": mapping}
+
+
+@route("GET", r"/api/upstream/oauth-model-alias")
+def upstream_model_alias(app: PanelApp, req: Request) -> Any:
+    return {"channels": app.client(req.qi("node_id")).get_oauth_model_alias()}
+
+
+@route("POST", r"/api/upstream/oauth-model-alias")
+def upstream_model_alias_set(app: PanelApp, req: Request) -> Any:
+    """设置某个渠道的模型别名；传空数组 = 删除该渠道。"""
+    data = req.json()
+    channel = str(data.get("channel") or data.get("provider") or "").strip()
+    if not channel:
+        raise ApiError("channel 必填", 400)
+    aliases = data.get("aliases")
+    if not isinstance(aliases, list):
+        raise ApiError("aliases 必须是数组（空数组表示删除该渠道）", 400)
+    normalized = [a for a in aliases
+                  if isinstance(a, dict) and a.get("name") and a.get("alias")]
+    client = app.client(as_int(data.get("node_id")))
+    mapping = client.get_oauth_model_alias()
+    before = mapping.get(channel)
+    if normalized:
+        mapping[channel] = normalized
+    else:
+        mapping.pop(channel, None)
+    client.put_oauth_model_alias(mapping)
+    app.store.audit("upstream.oauth_model_alias", actor=req.user or "?", target=channel,
+                    detail=short(jdump({"before": before, "after": normalized}), 300),
+                    ip=req.client_ip)
+    return {"ok": True, "channel": channel, "aliases": normalized, "channels": mapping}
+
+
+@route("GET", r"/api/upstream/request-log")
+def upstream_request_log(app: PanelApp, req: Request) -> Any:
+    """请求日志开关的当前值。
+
+    从上游 `/config` 里读；读不到就返回 `None` —— 不编一个假值出来。
+    """
+    config = app.client(req.qi("node_id")).get_config()
+    value = None
+    observability = config.get("observability") if isinstance(config, dict) else None
+    if isinstance(observability, dict):
+        for key in ("request-log", "request-log-enabled", "request_log"):
+            if key in observability:
+                value = observability[key]
+                break
+    return {"enabled": value}
+
+
+@route("POST", r"/api/upstream/request-log")
+def upstream_request_log_set(app: PanelApp, req: Request) -> Any:
+    """开/关上游请求日志。"""
+    data = req.json()
+    if "enabled" not in data:
+        raise ApiError("enabled 必填（true/false）", 400)
+    enabled = as_bool(data.get("enabled"))
+    app.client(as_int(data.get("node_id"))).set_request_log(enabled)
+    app.store.audit("upstream.request_log", actor=req.user or "?", target=str(enabled),
+                    ip=req.client_ip)
+    return {"ok": True, "enabled": enabled}
 
 
 # --------------------------------------------------------------------------- 日志
