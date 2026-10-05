@@ -1,5 +1,24 @@
 # 变更记录
 
+## 0.2.1 — 2026-10-05
+
+### 修复
+
+- **手机浏览器打开后面板顶部一大片空白**（用户实测发现）。
+  `hidden` 属性只是 **UA 样式表**里的 `display: none`，而作者样式里写的任何 display 都会把它盖掉 ——
+  `.gate { min-height: 100%; display: flex; background: … }` 正是如此。
+  后果：「已隐藏」的启动页 `#booting` 与登录页 `#gate`（以及初始隐藏的 `#app`）
+  仍然按满屏高度参与布局、还画上不透明底色，把面板整体顶下去一整屏。
+  修法：文件顶部加一条**全局** `[hidden] { display: none !important }`，
+  并删掉 `.modal-root[hidden]` / `.batchbar[hidden]` 这类逐个元素的写法
+  （**正是那种写法漏掉了 `#gate` / `#booting`**）。
+
+### 测试
+
+- 新增 `tests/test_ui_static.py`（4 例）：把这个 bug 变成断言 —— 全局 `[hidden]` 规则必须存在
+  且带 `!important`、骨架元素的 hidden 切换关系必须正确（`#booting` 初始可见、`#gate`/`#app` 初始隐藏）、
+  不允许用内联 style 代替 `hidden`。**151 个用例全绿**（此前 147）。
+
 ## 0.2.0 — 2026-10-05
 
 这一版的重点是**安全护栏**与**上游契约的准确性**：功能与竞品对比后补上缺口，

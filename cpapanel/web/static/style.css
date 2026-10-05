@@ -94,6 +94,14 @@ html[data-theme="dark"] {
 /* ---------------------------------------------------------------- 基础 */
 * { box-sizing: border-box; }
 
+/* ⚠️ `hidden` 属性只是 **UA 样式表**里的 `display: none`，而作者写的任何 display
+   （这里的 `.gate`/`.app` 都是 flex）都会把它盖掉 → 「已隐藏」的元素照样参与布局。
+   加上 `.gate { min-height: 100% }` 与不透明底色，登录页/启动页即使 hidden 也会
+   按满屏高度占位并遮挡内容 —— 表现就是**顶部一大片空白**（手机上尤其明显）。
+   用 !important 以免靠源码顺序；不要再逐个写 `.xxx[hidden]`，那正是上次漏掉
+   #gate / #booting 的原因。 */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
@@ -382,7 +390,8 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 .donut-wrap .legend { width: 100%; }
 
 /* ---------------------------------------------------------------- 模态 */
-.modal-root[hidden] { display: none; }
+/* 注：`.modal-root[hidden]` 之类逐个元素的写法已删除 —— 统一由文件顶部的
+   全局 `[hidden]` 规则处理，避免再次漏掉某个元素。 */
 .modal-backdrop {
   position: fixed; inset: 0; z-index: 60;
   background: rgba(0, 0, 0, 0.42);
@@ -469,7 +478,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   border-radius: var(--radius);
   box-shadow: var(--shadow-lift);
 }
-.batchbar[hidden] { display: none; }
+/* 同上：批量条也由全局 `[hidden]` 规则处理 */
 .batchbar .batch-count { font-weight: 600; white-space: nowrap; }
 .batchbar .row { gap: 6px; }
 body.batch-open .toasts { bottom: calc(104px + env(safe-area-inset-bottom)); }

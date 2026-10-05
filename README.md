@@ -80,7 +80,7 @@ cpa-panel 补的是上游不提供的三件事 —— **历史、判定、护栏
 
 ```bash
 make check     # 全量测试 + CLI 端到端冒烟（提交前跑这一条）
-make test      # 147 个单元/集成用例
+make test      # 151 个单元/集成用例
 make smoke     # 37 项 CLI 冒烟（对着内置 Mock CPA 演练 init→collect→inspect→apply）
 ```
 

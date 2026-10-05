@@ -28,7 +28,7 @@ tests/
 
 ```bash
 make check      # = make test + make smoke + make docs-check，提交前跑这一条
-make test       # 147 个单元/集成用例
+make test       # 151 个单元/集成用例
 make smoke      # 37 项 CLI 冒烟
 make docs-check # 文档与代码一致性（端点 / 上游路径 / 配置项）
 ```
